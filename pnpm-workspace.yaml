@@ -1,0 +1,18 @@
+packages:
+  - packages/*
+
+onlyBuiltDependencies:
+  - '@prisma/client'
+  - '@prisma/engines'
+  - '@tailwindcss/oxide'
+  - bigint-buffer
+  - blake-hash
+  - bufferutil
+  - prisma
+  - protobufjs
+  - sharp
+  - sqlite3
+  - tiny-secp256k1
+  - unrs-resolver
+  - usb
+  - utf-8-validate

@@ -1,0 +1,109 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?
+// Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
+
+generator client {
+  provider = "prisma-client-js"
+  
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id            Int      @id @default(autoincrement())
+  walletAddress String   @unique
+  name          String?
+  balance       Float?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  goals Goal[] // A user can have multiple goals
+
+  // Relation to Budget and Expense
+  budget        Budget?
+  expenses      Expense[]
+}
+
+model Goal {
+  id           Int      @id @default(autoincrement())
+  name         String   // e.g., "New Bicycle", "Rainy Day Fund"
+  targetAmount Float
+  currentAmount Float   @default(0)
+  type         GoalType // SAVINGS or INVESTMENT
+  deadline     DateTime? // Optional deadline
+
+  userId       Int
+  user         User     @relation(fields: [userId], references: [id])
+  
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+}
+
+enum GoalType {
+  SAVINGS
+  INVESTMENT
+}
+
+model Budget {
+  id        Int      @id @default(autoincrement())
+  amount    Float
+  currency  String
+  
+  // ✨ New Fields for a Robust Budget Lifecycle
+  period    BudgetPeriod @default(weekly) //"Daily", "weekly" or "monthly"
+  status    BudgetStatus @default(ACTIVE) // "ACTIVE" or "ENDED"
+  startDate DateTime     @default(now())
+  endDate   DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  isRecurring Boolean @default(false)
+
+  userId    Int      @unique
+  user      User     @relation(fields: [userId], references: [id])
+}
+
+enum BudgetPeriod {
+  daily
+  weekly
+  monthly
+}
+
+enum BudgetStatus {
+  ACTIVE
+  ENDED
+}
+
+model Expense {
+  id            Int      @id @default(autoincrement())
+  amount        Float
+  amountUSD    Float?   // New field for USD equivalent
+  amountNGN    Float?   // New field for NGN equivalent
+  description   String
+  category      String   // "food", "transport", "entertainment", etc.
+  currency      String   // "NGN" or "USD"
+  type          TxType?
+  date          DateTime @default(now())
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  txSig       String?  @unique
+
+
+  // Relation to User
+  userId        Int
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([category])
+  @@index([date])
+}
+
+enum TxType {
+  income
+  expense
+}
