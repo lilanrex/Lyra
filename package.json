@@ -3,8 +3,10 @@
   "version": "1.0.0",
   "description": "",
   "main": "index.js",
-  "scripts": {
-    "test": "mocha -t 1000000 'packages/contracts/finai-budget/tests/**/*.cjs'"
+ "scripts": {
+    "build:frontend": "cd packages/frontend && npm run build",
+    "build:backend": "cd packages/backend && npm run build",
+    "start:backend": "cd packages/backend && npm start"
   },
   "keywords": [],
   "author": "",
