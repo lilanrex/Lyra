@@ -32,6 +32,15 @@ interface Expense {
     createdAt: string;
 }
 
+interface Goal {
+    id: number;
+    name: string;
+    targetAmount: number;
+    currentAmount: number;
+    type: 'SAVINGS' | 'INVESTMENT';
+    currency: 'NGN' | 'USD';
+}
+
 // ... (Your existing types and NameInputModal component) ...
 
 // Simple NameInputModal definition (replace with your actual implementation if needed)
@@ -150,6 +159,21 @@ const getInitialMessages = () => {
     { id: 1, type: 'ai', content: "Hey there! I'm LyraAI, your personal financial AI Agent.", timestamp: new Date().toLocaleTimeString() }
   ];
 };
+
+const fetchUserGoals = async (walletAddress: string): Promise<Goal[]> => {
+    try {
+        const res = await authenticatedFetch(`http://localhost:3001/api/goals/${walletAddress}`);
+        const data = await res.json();
+        if (data.success && data.goals) {
+            return data.goals;
+        }
+        return [];
+    } catch (error) {
+        console.error("Failed to fetch goals:", error);
+        return [];
+    }
+};
+
 
 export default function ChatPage() {
   const [messages, setMessages] = useState(getInitialMessages);
@@ -410,62 +434,119 @@ const handleNameSubmit = async (name: string, email: string) => {
 
 
 
-    const handleOnChainAction = async (action: 'save' | 'stake', amount: number, currency: string, goalId?: number) => {
-        if (!connected || !publicKey) {
-            // ... (error handling)
-            return;
-        }
+   const handleOnChainAction = async (action: 'save' | 'stake', amount: number, currency: string, goalId?: number) => {
+    if (!connected || !publicKey) {
+        const errorMessage = {
+            id: window.crypto.randomUUID(),
+            type: 'ai' as const,
+            content: `⚠️ Please connect your wallet first to perform on-chain actions.`,
+            timestamp: new Date().toLocaleTimeString(),
+        };
+        setMessages((prev: any) => [...prev, errorMessage]);
+        return;
+    }
 
-        setIsTyping(true);
-        try {
-            const res = await authenticatedFetch(`http://localhost:3001/api/action/${action}`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ amount, currency, goalId }),
-            });
-            if (!res.ok) {
-                const errorData = await res.json();
-                throw new Error(errorData.detail || 'Failed to prepare transaction.');
-            }
-            
-            const { transaction: serializedTransaction } = await res.json();
-            const transactionBuffer = Buffer.from(serializedTransaction, 'base64');
-            
-            let transaction;
-            try {
-                transaction = Transaction.from(transactionBuffer);
-            } catch (e) {
-                transaction = VersionedTransaction.deserialize(transactionBuffer);
-            }
-            
-            const txSignature = await sendTransaction(transaction, connection);
-            
-            await authenticatedFetch(`http://localhost:3001/api/action/confirm-action`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ txSig: txSignature, action, amount, currency, goalId }),
-            });
-
-            const successMessage = {
-                id: window.crypto.randomUUID(),
-                type: 'ai' as const,
-                content: `✅ Success! I've initiated the ${action} of ${amount.toFixed(2)} ${currency}. You can view the transaction on Solscan once confirmed.`,
-            };
-            setMessages((prev: any) => [...prev, successMessage]);
-
-        } catch (error: any) {
-            // Add a detailed error message to the chat
-            const errorMessageContent = error instanceof Error ? error.message : "An unexpected error occurred.";
+    // If it's a save action and no goalId is provided, try to find one
+    let finalGoalId = goalId;
+    if (action === 'save' && !finalGoalId && user?.walletAddress) {
+        console.log('[handleOnChainAction] No goalId provided for save action, fetching goals...');
+        const userGoals = await fetchUserGoals(user.walletAddress);
+        const savingsGoal = userGoals.find(g => g.type === 'SAVINGS');
+        
+        if (savingsGoal) {
+            finalGoalId = savingsGoal.id;
+            console.log('[handleOnChainAction] Found savings goal:', finalGoalId);
+        } else {
             const errorMessage = {
                 id: window.crypto.randomUUID(),
                 type: 'ai' as const,
-                content: `⚠️ Action Failed: ${errorMessageContent}`,
+                content: `⚠️ You don't have any savings goals set up yet. Please create a savings goal first.`,
+                timestamp: new Date().toLocaleTimeString(),
             };
             setMessages((prev: any) => [...prev, errorMessage]);
-        } finally {
-            setIsTyping(false);
+            return;
         }
-    };
+    }
+
+    setIsTyping(true);
+    console.log(`[handleOnChainAction] Starting ${action} with:`, { amount, currency, goalId: finalGoalId });
+    
+    try {
+        // Step 1: Prepare the transaction
+        const res = await authenticatedFetch(`http://localhost:3001/api/action/${action}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ amount, currency, goalId: finalGoalId }),
+        });
+        
+        if (!res.ok) {
+            const errorData = await res.json();
+            console.error('[handleOnChainAction] Failed to prepare transaction:', errorData);
+            throw new Error(errorData.detail || errorData.error || 'Failed to prepare transaction.');
+        }
+        
+        const { transaction: serializedTransaction } = await res.json();
+        console.log('[handleOnChainAction] Transaction prepared successfully');
+        
+        // Step 2: Deserialize and sign the transaction
+        const transactionBuffer = Buffer.from(serializedTransaction, 'base64');
+        
+        let transaction;
+        try {
+            transaction = Transaction.from(transactionBuffer);
+        } catch (e) {
+            transaction = VersionedTransaction.deserialize(transactionBuffer);
+        }
+        
+        // Step 3: Send the transaction
+        const txSignature = await sendTransaction(transaction, connection);
+        console.log(`[handleOnChainAction] ${action} transaction sent! Signature:`, txSignature);
+        
+        // Step 4: CRITICAL - Confirm the action on the backend with goalId
+        const confirmRes = await authenticatedFetch(`http://localhost:3001/api/action/confirm-action`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ 
+                txSig: txSignature, 
+                action, 
+                amount, 
+                currency,
+                goalId: finalGoalId  // This MUST be included for goal updates!
+            }),
+        });
+
+        if (!confirmRes.ok) {
+            const confirmError = await confirmRes.json();
+            console.error('[handleOnChainAction] Failed to confirm action:', confirmError);
+            throw new Error('Transaction sent but failed to update records. Please contact support.');
+        }
+
+        const confirmData = await confirmRes.json();
+        console.log('[handleOnChainAction] Action confirmed successfully:', confirmData);
+
+        // Step 5: Show success message
+        const successMessage = {
+            id: window.crypto.randomUUID(),
+            type: 'ai' as const,
+            content: `✅ Success! I've ${action === 'save' ? 'saved' : 'staked'} ${amount.toFixed(2)} ${currency}${finalGoalId ? ' to your goal' : ''}. Transaction: ${txSignature.slice(0, 8)}...${txSignature.slice(-8)}`,
+            timestamp: new Date().toLocaleTimeString(),
+        };
+        setMessages((prev: any) => [...prev, successMessage]);
+
+    } catch (error: any) {
+        console.error('[handleOnChainAction] Error:', error);
+        const errorMessageContent = error instanceof Error ? error.message : "An unexpected error occurred.";
+        const errorMessage = {
+            id: window.crypto.randomUUID(),
+            type: 'ai' as const,
+            content: `⚠️ Action Failed: ${errorMessageContent}`,
+            timestamp: new Date().toLocaleTimeString(),
+        };
+        setMessages((prev: any) => [...prev, errorMessage]);
+    } finally {
+        setIsTyping(false);
+    }
+};
 
 
     // Function to handle sending a message
@@ -518,110 +599,133 @@ const handleNameSubmit = async (name: string, email: string) => {
 
         // FIX: Improved execute_split action handling
         if (data.intent?.action === 'execute_split') {
-            console.log("[Chat Page] Execute split action detected:", data.intent);
+    console.log("[Chat Page] Execute split action detected:", data.intent);
 
+    try {
+        // Get fresh financial data
+        const financialsRes = await authenticatedFetch(`http://localhost:3001/api/reports/financials/${user.walletAddress}`);
+        
+        if (!financialsRes.ok) {
+            throw new Error('Failed to fetch financial data');
+        }
+
+        const financialsData = await financialsRes.json();
+        console.log("[Chat Page] Financials data received:", financialsData);
+
+        if (!financialsData.success) {
+            throw new Error('Financial data request was not successful');
+        }
+
+        if (!financialsData.surplus || financialsData.surplus <= 0) {
+            const noSurplusMessage = {
+                id: window.crypto.randomUUID(),
+                type: 'ai' as const,
+                content: "It looks like you don't have a surplus to take action on right now.",
+                timestamp: new Date().toLocaleTimeString(),
+            };
+            setMessages((prev: any) => [...prev, noSurplusMessage]);
+            return;
+        }
+
+        const freshSurplus = financialsData.surplus;
+        const budgetCurrency = financialsData.budget?.currency || 'USD';
+        
+        // Parse the suggestedSplit JSON string
+        let split;
+        try {
+            split = typeof data.intent.suggestedSplit === 'string' 
+                ? JSON.parse(data.intent.suggestedSplit) 
+                : data.intent.suggestedSplit;
+        } catch (parseError) {
+            console.error("[Chat Page] Failed to parse suggestedSplit:", data.intent.suggestedSplit);
+            throw new Error('Invalid split configuration received from AI');
+        }
+
+        console.log("[Chat Page] Processing split:", { freshSurplus, budgetCurrency, split });
+
+        // ✅ FIX: Fetch user goals to get the goalId
+        const userGoals = await fetchUserGoals(user.walletAddress);
+        const savingsGoal = userGoals.find(g => g.type === 'SAVINGS');
+        const goalId = savingsGoal?.id;
+
+        if (!goalId && split.savePercent > 0) {
+            const noGoalMessage = {
+                id: window.crypto.randomUUID(),
+                type: 'ai' as const,
+                content: "You need to create a savings goal first before I can save your surplus.",
+                timestamp: new Date().toLocaleTimeString(),
+            };
+            setMessages((prev: any) => [...prev, noGoalMessage]);
+            return;
+        }
+
+        // Execute actions in sequence to avoid conflicts
+        type ActionItem = {
+            action: 'save' | 'stake';
+            amount: number;
+        };
+        const actions: ActionItem[] = [];
+        
+        if (split.stakePercent && split.stakePercent > 0) {
+            const stakeAmount = freshSurplus * (split.stakePercent / 100);
+            actions.push({ action: 'stake', amount: stakeAmount });
+        }
+
+        if (split.savePercent && split.savePercent > 0) {
+            const saveAmount = freshSurplus * (split.savePercent / 100);
+            actions.push({ action: 'save', amount: saveAmount });
+        }
+
+        // Execute actions sequentially
+        for (const actionItem of actions) {
+            console.log(`[Chat Page] Executing ${actionItem.action} action:`, actionItem.amount);
             try {
-                // Get fresh financial data
-                const financialsRes = await authenticatedFetch(`http://localhost:3001/api/reports/financials/${user.walletAddress}`);
+                // ✅ FIX: Pass goalId for save actions
+                await handleOnChainAction(
+                    actionItem.action, 
+                    actionItem.amount, 
+                    budgetCurrency, 
+                    actionItem.action === 'save' ? goalId : undefined
+                );
                 
-                if (!financialsRes.ok) {
-                    throw new Error('Failed to fetch financial data');
+                // Add a small delay between actions to ensure they don't conflict
+                if (actions.length > 1) {
+                    await new Promise(resolve => setTimeout(resolve, 1000));
                 }
-
-                const financialsData = await financialsRes.json();
-                console.log("[Chat Page] Financials data received:", financialsData);
-
-                if (!financialsData.success) {
-                    throw new Error('Financial data request was not successful');
-                }
-
-                if (!financialsData.surplus || financialsData.surplus <= 0) {
-                    const noSurplusMessage = {
-                        id: window.crypto.randomUUID(),
-                        type: 'ai' as const,
-                        content: "It looks like you don't have a surplus to take action on right now.",
-                        timestamp: new Date().toLocaleTimeString(),
-                    };
-                    setMessages((prev: any) => [...prev, noSurplusMessage]);
-                    return;
-                }
-
-                const freshSurplus = financialsData.surplus;
-                const budgetCurrency = financialsData.budget?.currency || 'USD';
-                
-                // Parse the suggestedSplit JSON string
-                let split;
-                try {
-                    split = typeof data.intent.suggestedSplit === 'string' 
-                        ? JSON.parse(data.intent.suggestedSplit) 
-                        : data.intent.suggestedSplit;
-                } catch (parseError) {
-                    console.error("[Chat Page] Failed to parse suggestedSplit:", data.intent.suggestedSplit);
-                    throw new Error('Invalid split configuration received from AI');
-                }
-
-                console.log("[Chat Page] Processing split:", { freshSurplus, budgetCurrency, split });
-
-                // Execute actions in sequence to avoid conflicts
-                type ActionItem = {
-                    action: 'save' | 'stake';
-                    amount: number;
-                };
-                const actions: ActionItem[] = [];
-                
-                if (split.stakePercent && split.stakePercent > 0) {
-                    const stakeAmount = freshSurplus * (split.stakePercent / 100);
-                    actions.push({ action: 'stake', amount: stakeAmount });
-                }
-
-                if (split.savePercent && split.savePercent > 0) {
-                    const saveAmount = freshSurplus * (split.savePercent / 100);
-                    actions.push({ action: 'save', amount: saveAmount });
-                }
-
-                // Execute actions sequentially
-                for (const actionItem of actions) {
-                    console.log(`[Chat Page] Executing ${actionItem.action} action:`, actionItem.amount);
-                    try {
-                        await handleOnChainAction(actionItem.action, actionItem.amount, budgetCurrency, data.intent.goalId);
-                        // Add a small delay between actions to ensure they don't conflict
-                        if (actions.length > 1) {
-                            await new Promise(resolve => setTimeout(resolve, 1000));
-                        }
-                    } catch (actionError: any) {
-                        console.error(`[Chat Page] Error executing ${actionItem.action}:`, actionError);
-                        const actionErrorMessage = {
-                            id: window.crypto.randomUUID(),
-                            type: 'ai' as const,
-                            content: `Failed to execute ${actionItem.action}: ${actionError.message}`,
-                            timestamp: new Date().toLocaleTimeString(),
-                        };
-                        setMessages((prev: any) => [...prev, actionErrorMessage]);
-                    }
-                }
-
-                // If no percentages were provided, show an error
-                if ((!split.stakePercent || split.stakePercent <= 0) && (!split.savePercent || split.savePercent <= 0)) {
-                    const invalidSplitMessage = {
-                        id: window.crypto.randomUUID(),
-                        type: 'ai' as const,
-                        content: "I couldn't determine valid percentages for saving or staking. Please try rephrasing your request.",
-                        timestamp: new Date().toLocaleTimeString(),
-                    };
-                    setMessages((prev: any) => [...prev, invalidSplitMessage]);
-                }
-
-            } catch (splitError: any) {
-                console.error("[Chat Page] Error in execute_split:", splitError);
-                const errorMessage = {
+            } catch (actionError: any) {
+                console.error(`[Chat Page] Error executing ${actionItem.action}:`, actionError);
+                const actionErrorMessage = {
                     id: window.crypto.randomUUID(),
                     type: 'ai' as const,
-                    content: `Error executing your request: ${splitError.message || 'Unknown error occurred'}`,
+                    content: `Failed to execute ${actionItem.action}: ${actionError.message}`,
                     timestamp: new Date().toLocaleTimeString(),
                 };
-                setMessages((prev: any) => [...prev, errorMessage]);
+                setMessages((prev: any) => [...prev, actionErrorMessage]);
             }
         }
+
+        // If no percentages were provided, show an error
+        if ((!split.stakePercent || split.stakePercent <= 0) && (!split.savePercent || split.savePercent <= 0)) {
+            const invalidSplitMessage = {
+                id: window.crypto.randomUUID(),
+                type: 'ai' as const,
+                content: "I couldn't determine valid percentages for saving or staking. Please try rephrasing your request.",
+                timestamp: new Date().toLocaleTimeString(),
+            };
+            setMessages((prev: any) => [...prev, invalidSplitMessage]);
+        }
+
+    } catch (splitError: any) {
+        console.error("[Chat Page] Error in execute_split:", splitError);
+        const errorMessage = {
+            id: window.crypto.randomUUID(),
+            type: 'ai' as const,
+            content: `Error executing your request: ${splitError.message || 'Unknown error occurred'}`,
+            timestamp: new Date().toLocaleTimeString(),
+        };
+        setMessages((prev: any) => [...prev, errorMessage]);
+    }
+}
 
     } catch (error) {
         console.error('Error sending message to AI:', error);

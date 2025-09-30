@@ -123,7 +123,7 @@ export default function Home() {
               </div>
               <div>
                 <h1 className="text-xl font-bold bg-gradient-to-r from-purple-300 to-cyan-300 bg-clip-text text-transparent tracking-wide">
-                  Sol-AI
+                  LyraAI
                 </h1>
                 <p className="text-xs text-gray-500 font-light">Your AI Financial Assistant</p>
               </div>
@@ -184,7 +184,7 @@ export default function Home() {
                 <Bot className="w-4 h-4 text-black" />
               </div>
               <span className="text-sm text-gray-400 font-light">
-                Sol-AI is powered by advanced AI. Always verify financial advice and do your own research.
+                LyraAI is powered by advanced AI. Always verify financial advice and do your own research.
               </span>
             </div>
             

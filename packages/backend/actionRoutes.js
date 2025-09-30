@@ -29,8 +29,17 @@ const { PrismaClient } = pkg;
 const prisma = new PrismaClient();
 const router = express.Router();
 
-// Force devnet connection - don't rely on env variable for testing
-const connection = new Connection('https://api.devnet.solana.com', 'confirmed');
+const RPC_URL = process.env.SOLANA_RPC_URL || clusterApiUrl("devnet");
+const WS_URL = process.env.SOLANA_WS_URL || RPC_URL.replace('https://', 'wss://').replace('http://', 'ws://');
+
+const connection = new Connection(
+  RPC_URL,
+  {
+    commitment: "confirmed",
+    wsEndpoint: WS_URL,
+    confirmTransactionInitialTimeout: 60000 // 60 second timeout
+  }
+);
 
 // Verify we're on devnet
 console.log('🌐 Connected to:', connection.rpcEndpoint);

@@ -155,7 +155,7 @@ router.get('/weekly-summary', authenticateToken, async (req, res) => {
 
         const { name, budget, expenses, goals } = userWithData;
         const reportCurrency = budget?.currency || 'USD';
-        const currencySymbol = reportCurrency === 'USD' ? '$' : '₦';
+       const currencySymbol = reportCurrency === 'USD' ? '$' : 'NGN ';
 
         // 2. Set up the PDF document with better margins
         const doc = new PDFDocument({ 

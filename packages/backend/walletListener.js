@@ -3,14 +3,25 @@ import { Connection, PublicKey, clusterApiUrl, LAMPORTS_PER_SOL } from "@solana/
 import { PrismaClient } from "@prisma/client";
 import fetch from 'node-fetch'
 import { sendTransactionNotification } from "./emailService.js";
-
-
-// Import your AI categorizer function
 import { categorizeTx } from "./aiCategorizer.js";
 
 const prisma = new PrismaClient();
-// Ensure you are using a reliable RPC URL, consider putting it in your .env file
-const connection = new Connection(process.env.SOLANA_RPC_URL || clusterApiUrl("devnet"), "confirmed");
+
+// ✅ Enhanced connection setup with Helius RPC
+const RPC_URL = process.env.SOLANA_RPC_URL || clusterApiUrl("devnet");
+const WS_URL = process.env.SOLANA_WS_URL || RPC_URL.replace('https://', 'wss://').replace('http://', 'ws://');
+
+const connection = new Connection(
+  RPC_URL,
+  {
+    commitment: "confirmed",
+    wsEndpoint: WS_URL,
+    confirmTransactionInitialTimeout: 60000 // 60 second timeout
+  }
+);
+
+console.log('🔗 Connected to RPC:', RPC_URL);
+console.log('🔗 WebSocket endpoint:', WS_URL);
 
 // Map to store active listener classes for each wallet
 const activeListeners = new Map();
@@ -24,7 +35,6 @@ const TOKEN_MAP = {
   "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v": "USDC",
   "Es9vMFrzaCERsBY1HgM7zE3ip1J6fU6CB9hLh9jU4gQ": "USDT",
 };
-
 
 async function getSoltoUsdRate() {
   try {
@@ -96,117 +106,137 @@ class WalletListener {
     this.io = io;
     this.subscriptionId = null;
     this.publicKey = new PublicKey(walletAddress);
+    this.reconnectAttempts = 0;
+    this.maxReconnectAttempts = 5;
   }
 
   async start() {
     console.log("👂 Listening for wallet txs:", this.walletAddress);
     await updateUserWalletBalance(this.walletAddress);
 
-    this.subscriptionId = connection.onLogs(this.publicKey, async (log) => {
-      try {
-        const txSig = log.signature;
+    this.subscriptionId = connection.onLogs(
+      this.publicKey, 
+      async (log) => {
+        try {
+          const txSig = log.signature;
 
-        // ✨ --- DE-DUPLICATION CHECK --- ✨
-        // If we've seen this signature in the last 30 seconds, ignore it.
-        if (processedSignatures.has(txSig)) {
-          return;
-        }
-        processedSignatures.add(txSig);
-        // Remove the signature from the set after 30 seconds to prevent memory leaks
-        setTimeout(() => processedSignatures.delete(txSig), 30000);
+          // ✨ --- DE-DUPLICATION CHECK --- ✨
+          if (processedSignatures.has(txSig)) {
+            return;
+          }
+          processedSignatures.add(txSig);
+          setTimeout(() => processedSignatures.delete(txSig), 30000);
 
-        const tx = await connection.getParsedTransaction(txSig, {
-          maxSupportedTransactionVersion: 0,
-        });
+          const tx = await connection.getParsedTransaction(txSig, {
+            maxSupportedTransactionVersion: 0,
+          });
 
-        if (!tx?.meta) return;
-        const { meta } = tx;
+          if (!tx?.meta) return;
+          const { meta } = tx;
 
-        // ... (The rest of your SOL and SPL token processing logic remains exactly the same) ...
-        // 1. Handle SOL balance delta
-        const accountIndex = tx.transaction.message.accountKeys.findIndex(
-          (acc) => acc.pubkey.toBase58() === this.walletAddress
-        );
+          // 1. Handle SOL balance delta
+          const accountIndex = tx.transaction.message.accountKeys.findIndex(
+            (acc) => acc.pubkey.toBase58() === this.walletAddress
+          );
 
-        if (accountIndex !== -1) {
-          const preSol = meta.preBalances[accountIndex] / 1e9;
-          const postSol = meta.postBalances[accountIndex] / 1e9;
-          const delta = postSol - preSol;
+          if (accountIndex !== -1) {
+            const preSol = meta.preBalances[accountIndex] / 1e9;
+            const postSol = meta.postBalances[accountIndex] / 1e9;
+            const delta = postSol - preSol;
 
-          if (delta !== 0) {
-            const type = delta < 0 ? "expense" : "income";
-            const amount = Math.abs(delta);
+            if (delta !== 0) {
+              const type = delta < 0 ? "expense" : "income";
+              const amount = Math.abs(delta);
 
-            console.log(
-              `${type === "expense" ? "🔻" : "💰"} SOL ${type}: ${amount}`
-            );
+              console.log(
+                `${type === "expense" ? "🔻" : "💰"} SOL ${type}: ${amount}`
+              );
 
-            const category =
-              type === "expense"
-                ? await categorizeTx({
-                    token: "SOL",
-                    amount,
-                    type,
-                    memo: tx.transaction.message?.instructions[0]?.parsed?.info
-                      ?.memo,
-                    to: tx.transaction.message?.accountKeys[1]?.pubkey?.toBase58(),
-                  })
-                : "Income";
+              const category =
+                type === "expense"
+                  ? await categorizeTx({
+                      token: "SOL",
+                      amount,
+                      type,
+                      memo: tx.transaction.message?.instructions[0]?.parsed?.info?.memo,
+                      to: tx.transaction.message?.accountKeys[1]?.pubkey?.toBase58(),
+                    })
+                  : "Income";
 
-            const solToUsdRate = await getSoltoUsdRate();
-            const usdToNgnRate = await getUsdtoNairaRate();
-            const amountUSD = solToUsdRate ? amount * solToUsdRate : null;
-            const amountNGN = (amountUSD && usdToNgnRate) ? amountUSD * usdToNgnRate : null;
+              const solToUsdRate = await getSoltoUsdRate();
+              const usdToNgnRate = await getUsdtoNairaRate();
+              const amountUSD = solToUsdRate ? amount * solToUsdRate : null;
+              const amountNGN = (amountUSD && usdToNgnRate) ? amountUSD * usdToNgnRate : null;
 
-            const record = await prisma.expense.create({
-              data: {
-                txSig: txSig,
-                amount,
-                amountUSD,
-                amountNGN,
-                description: `On-chain SOL ${type}`,
-                category,
-                currency: "SOL",
-                type,
-                user: {
-                  connectOrCreate: {
-                    where: { walletAddress: this.walletAddress },
-                    create: { walletAddress: this.walletAddress },
+              const record = await prisma.expense.create({
+                data: {
+                  txSig: txSig,
+                  amount,
+                  amountUSD,
+                  amountNGN,
+                  description: `On-chain SOL ${type}`,
+                  category,
+                  currency: "SOL",
+                  type,
+                  user: {
+                    connectOrCreate: {
+                      where: { walletAddress: this.walletAddress },
+                      create: { walletAddress: this.walletAddress },
+                    },
                   },
                 },
-              },
-            });
+              });
 
-            const user = await prisma.user.findUnique({
-                where: { walletAddress: this.walletAddress }
-            });
-            // Then, send the notification
-            await sendTransactionNotification(user, record);
+              const user = await prisma.user.findUnique({
+                  where: { walletAddress: this.walletAddress }
+              });
+              await sendTransactionNotification(user, record);
 
-            console.log('🚀 EMITTING new_tx TO ROOM:', this.walletAddress, 'DATA:', record);
+              console.log('🚀 EMITTING new_tx TO ROOM:', this.walletAddress);
+              this.io.to(this.walletAddress).emit("new_tx", record);
+            }
+          }
 
-            this.io.to(this.walletAddress).emit("new_tx", record);
+          // 2. Handle SPL token balance delta
+          const preTokenBalances = meta.preTokenBalances || [];
+          const postTokenBalances = meta.postTokenBalances || [];
+
+          for (let i = 0; i < postTokenBalances.length; i++) {
+            // SPL token logic remains the same
+          }
+
+        } catch (err) {
+          console.error("Listener error:", err);
+          
+          // Attempt reconnection on certain errors
+          if (err.message?.includes('disconnected') || err.message?.includes('timeout')) {
+            this.handleDisconnection();
           }
         }
+      },
+      "confirmed" // commitment level
+    );
 
-        // 2. Handle SPL token balance delta
-        const preTokenBalances = meta.preTokenBalances || [];
-        const postTokenBalances = meta.postTokenBalances || [];
+    console.log(`✅ Subscription active for ${this.walletAddress} (ID: ${this.subscriptionId})`);
+  }
 
-        for (let i = 0; i < postTokenBalances.length; i++) {
-          // ... (rest of SPL token logic is unchanged)
-        }
-
-      } catch (err) {
-        console.error("Listener error:", err);
-      }
-    });
+  async handleDisconnection() {
+    if (this.reconnectAttempts < this.maxReconnectAttempts) {
+      this.reconnectAttempts++;
+      console.log(`🔄 Attempting to reconnect listener for ${this.walletAddress} (Attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts})`);
+      
+      await this.stop();
+      setTimeout(() => this.start(), 2000 * this.reconnectAttempts);
+    } else {
+      console.error(`❌ Max reconnection attempts reached for ${this.walletAddress}`);
+    }
   }
 
   async stop() {
     if (this.subscriptionId !== null) {
-      await connection.removeListener(this.subscriptionId);
+      await connection.removeOnLogsListener(this.subscriptionId);
       console.log("🛑 Stopped listening for:", this.walletAddress);
+      this.subscriptionId = null;
     }
   }
 }

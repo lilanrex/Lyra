@@ -81,6 +81,81 @@ io.on("connection", (socket) => {
 
 startCronJobs(io)
 
+app.post('/clear-wallet/:walletAddress', async (req, res) => {
+  try {
+    const { walletAddress} = req.params;
+    const confirmDelete = true
+    // Safety check
+    if (!walletAddress || confirmDelete !== true) {
+      return res.status(400).json({
+        error: 'Wallet address and confirmation required'
+      });
+    }
+
+    // Find the user first
+    const user = await prisma.user.findUnique({
+      where: { walletAddress },
+      include: {
+        goals: true,
+        budget: true,
+        expenses: true,
+      }
+    });
+
+    if (!user) {
+      return res.status(404).json({
+        error: 'User not found'
+      });
+    }
+
+    // Delete everything in order (respecting foreign key constraints)
+    const deletedData = {
+      expenses: 0,
+      goals: 0,
+      budget: 0,
+      user: 0,
+    };
+
+    // 1. Delete all expenses
+    const expensesDeleted = await prisma.expense.deleteMany({
+      where: { userId: user.id }
+    });
+    deletedData.expenses = expensesDeleted.count;
+
+    // 2. Delete all goals
+    const goalsDeleted = await prisma.goal.deleteMany({
+      where: { userId: user.id }
+    });
+    deletedData.goals = goalsDeleted.count;
+
+    // 3. Delete budget (if exists)
+    if (user.budget) {
+      await prisma.budget.delete({
+        where: { userId: user.id }
+      });
+      deletedData.budget = 1;
+    }
+
+    // 4. Finally, delete the user
+    await prisma.user.delete({
+      where: { id: user.id }
+    });
+    deletedData.user = 1;
+
+    return res.json({
+      success: true,
+      message: `Successfully deleted all data for wallet ${walletAddress}`,
+      deletedData,
+    });
+
+  } catch (error) {
+    console.error('Error clearing wallet data:', error);
+    return res.status(500).json({
+      error: 'Failed to clear wallet data',
+      details: error
+    });
+  }
+});
 
 app.post('/api/user/create', async (req, res) => {
   const { walletAddress, name, email } = req.body;

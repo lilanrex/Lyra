@@ -135,11 +135,17 @@ export default function Dashboard() {
     try {
         const res = await authenticatedFetch(`http://localhost:3001/api/goals/${walletAddress}`);
         const data = await res.json();
-        if (data.success) {
+        console.log("Fetched goals data:", data); // Debug log
+        if (data.success && data.goals) {
+            console.log("Setting goals:", data.goals); // Debug log
             setGoals(data.goals);
+        } else {
+            console.log("No goals found or API call failed");
+            setGoals([]);
         }
     } catch (error) {
         console.error("Failed to fetch goals:", error);
+        setGoals([]);
     }
   };
 
@@ -651,7 +657,7 @@ useEffect(() => {
                 <div className="flex items-center justify-between">
                     <div className="text-left">
                       <h3 className="font-medium text-white">Stake Surplus for Yield</h3>
-                      <p className="text-sm text-gray-400">Contribute to network security and earn rewards.</p>
+                      <p className="text-sm text-gray-400">Invest in the ecosystem and earn rewards.</p>
                     </div>
                     <ArrowUpRight className="w-5 h-5 text-purple-400 group-hover:translate-x-1 group-hover:-translate-y-1 transition-transform" />
                 </div>

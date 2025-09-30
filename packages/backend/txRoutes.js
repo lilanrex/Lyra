@@ -11,7 +11,19 @@ dotenv.config();
 
 const router = express.Router();
 
-const connection = new Connection("https://api.devnet.solana.com", "confirmed");
+// ✅ Enhanced connection setup with Helius RPC
+const RPC_URL = process.env.SOLANA_RPC_URL || clusterApiUrl("devnet");
+const WS_URL = process.env.SOLANA_WS_URL || RPC_URL.replace('https://', 'wss://').replace('http://', 'ws://');
+
+const connection = new Connection(
+  RPC_URL,
+  {
+    commitment: "confirmed",
+    wsEndpoint: WS_URL,
+    confirmTransactionInitialTimeout: 60000 // 60 second timeout
+  }
+);
+
 
 // Backend fee payer
 const FEE_PAYER = Keypair.fromSecretKey(

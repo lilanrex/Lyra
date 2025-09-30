@@ -13,9 +13,9 @@ export default function WalletConnection({ onWalletConnected }: WalletConnection
   const { wallet, wallets, select, connect, connected, publicKey, disconnect, connecting } = useWallet();
   const [showWalletModal, setShowWalletModal] = useState(false);
 
-  const handleWalletSelect = async (walletName: string) => {
+  const handleWalletSelect = async (wallet: { adapter: { name: any } }) => {
     try {
-      select(walletName);
+      select(wallet.adapter.name);
       setShowWalletModal(false);
       // Let the connection happen naturally through the wallet adapter
       if (onWalletConnected && publicKey) {
@@ -70,7 +70,7 @@ export default function WalletConnection({ onWalletConnected }: WalletConnection
                 wallets.map((w) => (
                   <button
                     key={w.adapter.name}
-                    onClick={() => handleWalletSelect(w.adapter.name)}
+                    onClick={() => handleWalletSelect(w)}
                     disabled={connecting}
                     className="w-full flex items-center gap-4 p-4 bg-gray-800/50 hover:bg-gray-800 border border-gray-700/50 rounded-xl transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed"
                   >
