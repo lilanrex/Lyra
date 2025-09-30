@@ -192,7 +192,8 @@ router.get('/validate', authenticateToken, async (req, res) => {
       user: {
         id: user.id,
         walletAddress: user.walletAddress,
-        name: user.name
+        name: user.name,
+        email: user.email  // ADD THIS LINE
       },
       autoSign: req.user.autoSign || false
     });

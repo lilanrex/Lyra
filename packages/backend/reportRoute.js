@@ -7,7 +7,127 @@ const { PrismaClient } = pkg;
 const prisma = new PrismaClient();
 const router = express.Router();
 
+
+
+router.get('/reactivate-latest-budget', async (req, res) => {
+    // ✨ FIX: Replace this with your wallet address for testing.
+    const walletAddressForTesting = "AhwajZbujd6E28iD2Di7FkPwKW64dWqHSN3WAMGaJj27";
+
+    try {
+        const user = await prisma.user.findUnique({
+            where: { walletAddress: walletAddressForTesting },
+        });
+
+        if (!user) {
+            return res.status(404).json({ error: `User with wallet ${walletAddressForTesting} not found.` });
+        }
+
+        const latestBudget = await prisma.budget.findFirst({
+            where: { userId: user.id },
+            orderBy: { createdAt: 'desc' }
+        });
+
+        if (!latestBudget) {
+            return res.status(404).json({ error: "No budget found for this user to reactivate." });
+        }
+
+        const updatedBudget = await prisma.budget.update({
+            where: { id: latestBudget.id },
+            data: { status: 'ACTIVE' }
+        });
+
+        console.log(`[Test Util] Budget ${updatedBudget.id} has been manually set to ACTIVE.`);
+        return res.json({ 
+            success: true, 
+            message: `Budget ${updatedBudget.id} for wallet ${walletAddressForTesting} has been reactivated for testing.`,
+            budget: updatedBudget
+        });
+
+    } catch (error) {
+        console.error("Failed to reactivate budget:", error);
+        return res.status(500).json({ error: "Failed to reactivate budget." });
+    }
+});
 // GET /api/reports/weekly-summary
+
+router.get('/financials/:wallet', authenticateToken, async (req, res) => {
+    const { wallet } = req.params;
+
+    try {
+        // ✨ FIX: The query is now broken into two steps for correctness and clarity.
+        
+        // Step 1: Find the user by their wallet address.
+        const user = await prisma.user.findUnique({
+            where: { walletAddress: wallet }
+        });
+
+        if (!user) {
+            return res.status(404).json({ success: false, error: "User not found." });
+        }
+
+        // Step 2: Find the user's most recent budget record.
+        const latestBudget = await prisma.budget.findFirst({
+            where: { userId: user.id },
+            orderBy: { createdAt: 'desc' }
+        });
+
+        if (!latestBudget) {
+            return res.json({ success: true, surplus: 0, budget: null, reason: "No budget has been set up yet." });
+        }
+        
+        console.log('[Financials Endpoint] Found latest budget:', {
+            id: latestBudget.id,
+            amount: latestBudget.amount,
+            currency: latestBudget.currency,
+            startDate: latestBudget.startDate,
+            endDate: latestBudget.endDate,
+            status: latestBudget.status
+        });
+
+        const spendingAggregation = await prisma.expense.aggregate({
+            where: {
+                userId: user.id,
+                type: 'expense',
+                createdAt: {
+                    gte: new Date(latestBudget.startDate),
+                    lt: new Date(latestBudget.endDate)
+                }
+            },
+            _sum: {
+                amountUSD: latestBudget.currency === 'USD' ? true : undefined,
+                amountNGN: latestBudget.currency === 'NGN' ? true : undefined,
+            }
+        });
+        
+        const totalSpent = (latestBudget.currency === 'USD' 
+            ? spendingAggregation._sum.amountUSD 
+            : spendingAggregation._sum.amountNGN) || 0;
+
+        const surplus = latestBudget.amount - totalSpent;
+
+        console.log('[Financials Endpoint] Calculation:', {
+            totalSpent: totalSpent,
+            surplus: surplus > 0 ? surplus : 0
+        });
+
+        return res.json({
+            success: true,
+            surplus: surplus > 0 ? surplus : 0,
+            totalSpent: totalSpent,
+            budget: {
+                amount: latestBudget.amount,
+                currency: latestBudget.currency,
+                startDate: latestBudget.startDate,
+                endDate: latestBudget.endDate
+            }
+        });
+
+    } catch (error) {
+        console.error("Failed to fetch financials:", error);
+        res.status(500).json({ success: false, error: "Failed to fetch financial data." });
+    }
+});
+
 router.get('/weekly-summary', authenticateToken, async (req, res) => {
     const { userId, walletAddress } = req.user;
 

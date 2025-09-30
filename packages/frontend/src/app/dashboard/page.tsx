@@ -150,6 +150,19 @@ export default function Dashboard() {
     }
   }, [user?.walletAddress]);
 
+
+useEffect(() => {
+    if (user?.walletAddress) {
+        const interval = setInterval(() => {
+            console.log('[Polling] Refreshing dashboard data...');
+            fetchData(user.walletAddress);
+            fetchGoals(user.walletAddress);
+        }, 5000); // Refresh every 15 seconds
+
+        return () => clearInterval(interval); // Clean up the interval on component unmount
+    }
+  }, [user?.walletAddress]);
+
   // --- BACKEND ACTION HANDLERS ---
   const handleAction = async (action: 'save' | 'stake', goalId?: number) => {
     if (surplus <= 0) {

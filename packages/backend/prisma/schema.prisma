@@ -18,10 +18,13 @@ model User {
   id            Int      @id @default(autoincrement())
   walletAddress String   @unique
   name          String?
+  email         String?  @unique
   balance       Float?
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
   goals Goal[] // A user can have multiple goals
+
+  lastSuggestedSplit Json?
 
   // Relation to Budget and Expense
   budget        Budget?

@@ -56,9 +56,11 @@ const prompt = new PromptTemplate({
          - If the user ASKS A QUESTION about their budget (e.g., "what is my budget?", "do I have a budget?"), set the action to "get_budget".
       - If the user GIVES A COMMAND to create or change a budget (e.g., "set my budget to 500", "change my budget to 100k weekly"), set the action to "set_budget" and extract all details.
         → If the user mentions a recurring or repeating budget, set isRecurring to true.
-         **Report Generation**: If the user asks for a report, statement, or summary of their transactions (e.g., "send me my weekly report", "download my transactions"), set the action to "generate_report".
+         **Report Generation**: If the user asks for a report, statement, or summary of their transactions (e.g., "send me my weekly report", "download my transactions", "print my weekly transactions", "Give me a pdf of my reports"), set the action to "generate_report".
         → **ADVISOR TASK**: If the user asks for advice on their surplus ("how should I manage my surplus?", "save more or stake more?"), analyze their goals and the market data. Prioritize savings (USDC) for short-term goals and staking (SOL) for long-term growth, explaining the risks and rewards. Provide your advice in the "reply" and a structured split in "suggestedSplit". Set the action to "advise_on_surplus".
-        → **EXECUTION TASK**: If the user confirms your advice or gives a direct command like "save the surplus", set the action to "execute_split" and populate the "suggestedSplit" with the appropriate percentages.
+       **Execute a Command**: If the user gives a direct COMMAND (e.g., "stake my surplus", "save what's left") or confirms your previous advice ("yes, do it"), set the action to "execute_split".
+        - If it's a direct command for a single action, you MUST populate the "suggestedSplit" field with 100% for that action (e.g., for "stake it all", use {{"savePercent": 0, "stakePercent": 100}}).
+        - If the user is confirming previous advice, you do not need to populate "suggestedSplit", as the system will remember it.
         → Reply naturally in "reply".
 
     2.  General chat (small talk, questions not about money).
@@ -85,7 +87,7 @@ const prompt = new PromptTemplate({
 const model = new ChatOpenAI({
   model: 'gpt-4.1-mini',
   temperature: 0,
-  maxTokens: 200,
+  maxTokens: 800,
   apiKey: process.env.OPEN_AI_KEY,
 });
 
@@ -194,10 +196,14 @@ export async function parseIntent(input, user) {
 
     console.log("Raw LLM response:", response.content);
 
-    const cleanedRes = response.content
-      .trim()
-      .replace(/^```json\n?/, '')
-      .replace(/```$/, '');
+     let cleanedRes = response.content.trim();
+    // Find the first '{' and the last '}' to extract the JSON object.
+    const firstBrace = cleanedRes.indexOf('{');
+    const lastBrace = cleanedRes.lastIndexOf('}');
+    if (firstBrace === -1 || lastBrace === -1 || lastBrace < firstBrace) {
+        throw new Error("Could not find a valid JSON object in the AI response.");
+    }
+    cleanedRes = cleanedRes.substring(firstBrace, lastBrace + 1);
 
     const result = await parser.parse(cleanedRes);
 

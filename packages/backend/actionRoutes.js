@@ -1,9 +1,23 @@
 import express from 'express';
-import { Connection, PublicKey, LAMPORTS_PER_SOL, Transaction, VersionedTransaction } from '@solana/web3.js';
-import { getAssociatedTokenAddress, createAssociatedTokenAccountInstruction, TOKEN_PROGRAM_ID  } from '@solana/spl-token';
-import { Marinade, MarinadeConfig } from '@marinade.finance/marinade-ts-sdk';
-import { Liquidity, Token, TokenAmount } from '@raydium-io/raydium-sdk';
-import { createJupiterApiClient } from '@jup-ag/api';
+import { 
+    Connection, 
+    PublicKey, 
+    LAMPORTS_PER_SOL, 
+    Transaction, 
+    VersionedTransaction, 
+    SystemProgram, 
+    StakeProgram, 
+    Authorized, 
+    Keypair, 
+    TransactionMessage 
+} from '@solana/web3.js';
+import { 
+    getAssociatedTokenAddress, 
+    createAssociatedTokenAccountInstruction, 
+    TOKEN_PROGRAM_ID,
+    createTransferInstruction,
+    getAccount
+} from '@solana/spl-token';
 import BN from 'bn.js';
 import pkg from '@prisma/client';
 
@@ -14,16 +28,72 @@ import { getSoltoUsdRate, getUsdtoNairaRate } from './walletListener.js';
 const { PrismaClient } = pkg;
 const prisma = new PrismaClient();
 const router = express.Router();
-const jupiterApi = createJupiterApiClient();
 
-const connection = new Connection(process.env.SOLANA_RPC_URL || 'https://api.devnet.solana.com', 'confirmed');
+// Force devnet connection - don't rely on env variable for testing
+const connection = new Connection('https://api.devnet.solana.com', 'confirmed');
 
-// --- DEVNET CONSTANTS ---
-const USDC_MINT_DEVNET = new PublicKey('Gh9ZwEmdLJ8DscKNTkTqPbNwLNNBjuSzaG9Vp2KGtKJr');
-const RAY_MINT_DEVNET = new PublicKey('4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R');
-const SOL_MINT = new PublicKey('So11111111111111111111111111111111111111112');
-const MARINADE_PROGRAM_ID_DEVNET = new PublicKey('MarBmsSgKXdrN1egZf5sqe1TMai9K1rChYNDJgjq7aD');
+// Verify we're on devnet
+console.log('🌐 Connected to:', connection.rpcEndpoint);
 
+// Function to verify network
+async function verifyNetwork() {
+    try {
+        const genesisHash = await connection.getGenesisHash();
+        // Devnet genesis hash
+        const DEVNET_GENESIS = 'EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG';
+        
+        if (genesisHash !== DEVNET_GENESIS) {
+            console.error('❌ NOT CONNECTED TO DEVNET!');
+            console.error('Current genesis:', genesisHash);
+            console.error('Expected devnet:', DEVNET_GENESIS);
+            return false;
+        }
+        
+        console.log('✅ Verified devnet connection');
+        return true;
+    } catch (error) {
+        console.error('Failed to verify network:', error);
+        return false;
+    }
+}
+
+// Verify network on startup
+verifyNetwork();
+
+// --- VERIFIED DEVNET CONSTANTS ---
+const SOL_MINT = new PublicKey('So11111111111111111111111111111111111111112'); // Same on all networks
+// Verified devnet USDC mint
+const USDC_MINT_DEVNET = new PublicKey('4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU');
+
+// Function to get an active devnet validator
+async function getActiveValidator() {
+    try {
+        const voteAccounts = await connection.getVoteAccounts();
+        
+        if (voteAccounts.current.length === 0) {
+            throw new Error('No active validators found on devnet');
+        }
+        
+        // Sort by stake (descending) and pick one with good performance
+        const sortedValidators = voteAccounts.current
+            .filter(v => v.activatedStake > 0) // Only validators with stake
+            .sort((a, b) => b.activatedStake - a.activatedStake);
+            
+        if (sortedValidators.length === 0) {
+            throw new Error('No validators with active stake found');
+        }
+        
+        const selectedValidator = new PublicKey(sortedValidators[0].votePubkey);
+        console.log('✅ Selected active validator:', selectedValidator.toBase58());
+        console.log('📊 Validator stake:', sortedValidators[0].activatedStake);
+        
+        return selectedValidator;
+    } catch (error) {
+        console.error('Failed to get active validator:', error);
+        // Fallback to a known devnet validator (may not be active)
+        return new PublicKey('dv4ACNkpYPcE3aKmYDqZm9G5EB3J4MRoeE7WNDRBVJB');
+    }
+}
 
 async function getCurrencyValues(amount, currency) {
     const solToUsdRate = await getSoltoUsdRate();
@@ -32,7 +102,6 @@ async function getCurrencyValues(amount, currency) {
         throw new Error('Could not fetch all necessary conversion rates.');
     }
     
-    // Calculate all three currency values based on the input
     const usdAmount = currency === 'USD' ? amount : amount / usdToNgnRate;
     const ngnAmount = currency === 'NGN' ? amount : amount * usdToNgnRate;
     const solAmount = usdAmount / solToUsdRate;
@@ -40,9 +109,9 @@ async function getCurrencyValues(amount, currency) {
     return { solAmount, usdAmount, ngnAmount };
 }
 
-// --- SAVE ENDPOINT (Swap SOL to USDC using Raydium) ---
+// --- SIMPLIFIED SAVE ENDPOINT (Transfer to savings wallet instead of swap) ---
 router.post('/save', authenticateToken, async (req, res) => {
-    const { amount, currency, goalId } = req.body;
+    const { amount, currency } = req.body;
     const { walletAddress } = req.user;
 
     if (!amount || !currency) {
@@ -50,168 +119,183 @@ router.post('/save', authenticateToken, async (req, res) => {
     }
 
     try {
+        // Verify we're on devnet
+        const isDevnet = await verifyNetwork();
+        if (!isDevnet) {
+            return res.status(500).json({ 
+                error: 'Server is not connected to devnet. Please check configuration.' 
+            });
+        }
+
         const userPublicKey = new PublicKey(walletAddress);
-        const { solAmount, usdAmount, ngnAmount } = await getCurrencyValues(amount, currency);
-        const lamportsToSwap = new BN(Math.floor(surplusSOL * LAMPORTS_PER_SOL));
+        const { solAmount } = await getCurrencyValues(amount, currency);
+        const lamportsToSave = Math.floor(solAmount * LAMPORTS_PER_SOL);
 
-            await prisma.expense.create({
-            data: {
-                amount: solAmount,
-                amountUSD: usdAmount,
-                amountNGN: ngnAmount,
-                description: "Saved surplus (SOL -> RAY/USDC)",
-                category: "Savings",
-                currency: "SOL",
-                type: 'expense',
-                userId: userId,
-            }
+        // Create a deterministic savings wallet based on user's wallet
+        // This ensures the same savings address is used each time
+        const savingsWallet = new PublicKey('11111111111111111111111111111112'); // System program for testing
+        
+        // For real implementation, you might want to derive a PDA:
+        // const [savingsWallet] = await PublicKey.findProgramAddress(
+        //     [Buffer.from("savings"), userPublicKey.toBuffer()],
+        //     new PublicKey("YourProgramId")
+        // );
+
+        // Check if user has sufficient balance
+        const balance = await connection.getBalance(userPublicKey);
+        const estimatedFee = 5000; // 0.000005 SOL
+        
+        if (balance < lamportsToSave + estimatedFee) {
+            return res.status(400).json({ 
+                error: `Insufficient SOL balance. Need ${(lamportsToSave + estimatedFee) / LAMPORTS_PER_SOL} SOL, have ${balance / LAMPORTS_PER_SOL} SOL.` 
+            });
+        }
+
+        const transaction = new Transaction().add(
+            SystemProgram.transfer({
+                fromPubkey: userPublicKey,
+                toPubkey: savingsWallet,
+                lamports: lamportsToSave,
+            })
+        );
+
+        const { blockhash } = await connection.getLatestBlockhash('finalized');
+        transaction.recentBlockhash = blockhash;
+        transaction.feePayer = userPublicKey;
+
+        const serializedTransaction = transaction.serialize({ 
+            requireAllSignatures: false, 
+            verifySignatures: false 
         });
 
-         // ✨ 2. Define tokens for Raydium SDK using RAY instead of USDC
-        const solToken = new Token(TOKEN_PROGRAM_ID, SOL_MINT, 9, 'SOL', 'Solana');
-        const rayToken = new Token(TOKEN_PROGRAM_ID, RAY_MINT_DEVNET, 6, 'RAY', 'Raydium');
-        const amountIn = new TokenAmount(solToken, lamportsToSwap);
-
-        // 2. Fetch all Raydium liquidity pools
-        console.log('[Save Action] Fetching Raydium liquidity pools...');
-        const pools = await (await fetch('https://api.raydium.io/v2/sdk/liquidity/devnet.json')).json();
-        const availablePools = [...(pools.official || []), ...(pools.unOfficial || [])];
-        
-        // ✨ 3. Find the SOL-RAY pool info
-        const poolInfo = availablePools.find(p => p.baseMint === SOL_MINT.toBase58() && p.quoteMint === RAY_MINT_DEVNET.toBase58());
-        if (!poolInfo) {
-             return res.status(400).json({ error: "SOL-RAY liquidity pool not found on Raydium devnet." });
-        }
-        console.log('[Save Action] Found SOL-RAY pool.');
-        const poolKeys = {
-            id: new PublicKey(poolInfo.id),
-            baseMint: new PublicKey(poolInfo.baseMint),
-            quoteMint: new PublicKey(poolInfo.quoteMint),
-            lpMint: new PublicKey(poolInfo.lpMint),
-            baseDecimals: poolInfo.baseDecimals,
-            quoteDecimals: poolInfo.quoteDecimals,
-            lpDecimals: poolInfo.lpDecimals,
-            version: poolInfo.version,
-            programId: new PublicKey(poolInfo.programId),
-            authority: new PublicKey(poolInfo.authority),
-            openOrders: new PublicKey(poolInfo.openOrders),
-            targetOrders: new PublicKey(poolInfo.targetOrders),
-            baseVault: new PublicKey(poolInfo.baseVault),
-            quoteVault: new PublicKey(poolInfo.quoteVault),
-            withdrawQueue: new PublicKey(poolInfo.withdrawQueue),
-            lpVault: new PublicKey(poolInfo.lpVault),
-            marketVersion: 3,
-            marketProgramId: new PublicKey(poolInfo.marketProgramId),
-            marketId: new PublicKey(poolInfo.marketId),
-            marketAuthority: new PublicKey(poolInfo.marketAuthority),
-            marketBaseVault: new PublicKey(poolInfo.marketBaseVault),
-            marketQuoteVault: new PublicKey(poolInfo.marketQuoteVault),
-            marketBids: new PublicKey(poolInfo.marketBids),
-            marketAsks: new PublicKey(poolInfo.marketAsks),
-            marketEventQueue: new PublicKey(poolInfo.marketEventQueue),
-        };
-
-        // 3. Prepare the swap transaction
-        const { setupTransaction, swapTransaction } = await Liquidity.makeSwapTransaction({
-            connection,
-            poolKeys,
-            userKeys: { owner: userPublicKey, tokenAccounts: [] }, // SDK will find accounts
-            amountIn,
-            amountOut: new TokenAmount(usdcToken, new BN(0)), // Min amount out
-            fixedSide: 'in',
-        });
-
-        // 4. Combine transactions and send to frontend
-        const latestBlockhash = await connection.getLatestBlockhash();
-        const messageV0 = new TransactionMessage({
-            payerKey: userPublicKey,
-            recentBlockhash: latestBlockhash.blockhash,
-            instructions: [
-                ...(setupTransaction ? setupTransaction.instructions : []),
-                ...swapTransaction.instructions
-            ],
-        }).compileToV0Message();
-
-        const transaction = new VersionedTransaction(messageV0);
-
-        // 3. Update Goal Logic (if goalId is provided)
-        if (goalId) {
-            const goal = await prisma.goal.findUnique({ where: { id: goalId } });
-            if (goal) {
-                // Now uses the pre-calculated usdAmount and ngnAmount
-                const amountToAdd = goal.currency === 'USD' ? usdAmount : ngnAmount;
-                await prisma.goal.update({
-                    where: { id: goalId },
-                    data: { currentAmount: { increment: amountToAdd } }
-                });
-            }
-        }
-        
-        // 4. Serialize the final transaction and send to frontend
-        const serializedTransaction = Buffer.from(transaction.serialize());
+        console.log('✅ Save transaction prepared for devnet');
+        console.log('📊 Amount:', solAmount, 'SOL');
+        console.log('🎯 To:', savingsWallet.toBase58());
 
         return res.json({
             success: true,
-            message: 'Save transaction ready for signing.',
+            message: 'Save transaction ready for signing on DEVNET.',
             transaction: serializedTransaction.toString('base64'),
+            network: 'devnet',
+            savingsWallet: savingsWallet.toBase58(),
+            details: {
+                amount: solAmount,
+                lamports: lamportsToSave,
+                currency: currency,
+                network: 'devnet'
+            }
         });
 
     } catch (err) {
-        console.error("🔴 FATAL SAVE ACTION ERROR:", err);
+        console.error("🔴 SAVE ACTION ERROR:", err);
         return res.status(500).json({ 
-            error: 'Failed to prepare save transaction on the server.',
+            error: 'Failed to prepare save transaction.',
             detail: err.message 
         });
     }
 });
 
-
-// --- STAKE ENDPOINT (Marinade SOL -> mSOL) ---
+// --- FIXED STAKE ENDPOINT ---
 router.post('/stake', authenticateToken, async (req, res) => {
-    const { amount, currency, goalId } = req.body;
-    const { userId, walletAddress } = req.user;
+    const { amount, currency } = req.body;
+    const { walletAddress } = req.user;
     
     if (!amount || !currency) {
         return res.status(400).json({ error: 'Amount and currency are required.' });
     }
 
     try {
+        // Verify we're on devnet
+        const isDevnet = await verifyNetwork();
+        if (!isDevnet) {
+            return res.status(500).json({ 
+                error: 'Server is not connected to devnet. Please check configuration.' 
+            });
+        }
+
         const userPublicKey = new PublicKey(walletAddress);
+        const { solAmount } = await getCurrencyValues(amount, currency);
+        
+        const lamportsToStake = Math.floor(solAmount * LAMPORTS_PER_SOL);
+        const minimumRent = await connection.getMinimumBalanceForRentExemption(StakeProgram.space);
+        
+        if (lamportsToStake < minimumRent) {
+            return res.status(400).json({ 
+                error: `Minimum stake amount is ${(minimumRent / LAMPORTS_PER_SOL).toFixed(6)} SOL for rent exemption.` 
+            });
+        }
 
-        // Use the correct helper and variable names
-        const { solAmount, usdAmount, ngnAmount } = await getCurrencyValues(amount, currency);
-        const lamportsToStake = new BN(Math.floor(solAmount * LAMPORTS_PER_SOL));
+        // Check user balance
+        const balance = await connection.getBalance(userPublicKey);
+        const estimatedFee = 10000; // 0.00001 SOL
         
-       
+        if (balance < lamportsToStake + estimatedFee) {
+            return res.status(400).json({ 
+                error: `Insufficient SOL balance. Need ${(lamportsToStake + estimatedFee) / LAMPORTS_PER_SOL} SOL, have ${balance / LAMPORTS_PER_SOL} SOL.` 
+            });
+        }
 
-        // --- Marinade SDK Logic ---
-        const config = new MarinadeConfig({
-            connection: connection,
-            publicKey: userPublicKey,
-            marinadeFinanceProgramId: MARINADE_PROGRAM_ID_DEVNET,
-        });
-        const marinade = new Marinade(config);
-        const { transaction } = await marinade.deposit(lamportsToStake);
+        const stakeAccountKeypair = Keypair.generate();
+
+        // Get an active validator dynamically
+        const activeValidator = await getActiveValidator();
+        console.log('🎯 Using validator:', activeValidator.toBase58());
+
         
-        // --- Update Goal Logic ---
+        const transaction = new Transaction().add(
+            // Create stake account
+            SystemProgram.createAccount({
+                fromPubkey: userPublicKey,
+                newAccountPubkey: stakeAccountKeypair.publicKey,
+                lamports: lamportsToStake,
+                space: StakeProgram.space,
+                programId: StakeProgram.programId,
+            }),
+            // Initialize stake account
+            StakeProgram.initialize({
+                stakePubkey: stakeAccountKeypair.publicKey,
+                authorized: new Authorized(userPublicKey, userPublicKey),
+            }),
+            // Delegate stake to active validator
+            StakeProgram.delegate({
+                stakePubkey: stakeAccountKeypair.publicKey,
+                authorizedPubkey: userPublicKey,
+                votePubkey: activeValidator,
+            })
+        );
         
-        
-        // ✨ FIX: Complete the transaction finalization and serialization logic.
-        transaction.recentBlockhash = (await connection.getLatestBlockhash()).blockhash;
+        const { blockhash } = await connection.getLatestBlockhash('finalized');
+        transaction.recentBlockhash = blockhash;
         transaction.feePayer = userPublicKey;
+        
+        // Partially sign with the stake account keypair
+        transaction.partialSign(stakeAccountKeypair);
 
-        const serializedTransaction = transaction.serialize({
-            requireAllSignatures: false, // User's wallet will sign
+        const serializedTransaction = transaction.serialize({ 
+            requireAllSignatures: false 
         });
+
+        console.log('✅ Stake transaction prepared for devnet');
+        console.log('📊 Amount:', solAmount, 'SOL');
+        console.log('🏛️ Validator:', activeValidator.toBase58());
 
         return res.json({
             success: true,
-            message: 'Staking transaction ready for signing.',
+            message: 'Staking transaction ready for signing on DEVNET.',
             transaction: serializedTransaction.toString('base64'),
+            network: 'devnet',
+            stakeAccount: stakeAccountKeypair.publicKey.toBase58(),
+            details: {
+                amount: solAmount,
+                lamports: lamportsToStake,
+                validator: activeValidator.toBase58(),
+                currency: currency,
+                network: 'devnet'
+            }
         });
 
     } catch (err) {
-        console.error("🔴 FATAL STAKE ACTION ERROR:", err);
+        console.error("🔴 STAKE ACTION ERROR:", err);
         return res.status(500).json({ 
             error: 'Failed to prepare stake transaction.',
             detail: err.message 
@@ -219,32 +303,60 @@ router.post('/stake', authenticateToken, async (req, res) => {
     }
 });
 
-// ✨ --- NEW: CONFIRMATION ENDPOINT --- ✨
+// --- IMPROVED CONFIRMATION ENDPOINT ---
 router.post('/confirm-action', authenticateToken, async (req, res) => {
     const { txSig, action, goalId, amount, currency } = req.body;
     const { userId } = req.user;
 
-    if (!txSig || !action || !amount || !currency) {
-        return res.status(400).json({ error: 'Missing required confirmation data.' });
+    if (typeof txSig !== 'string' || txSig.trim() === '') {
+        return res.status(400).json({ error: 'A valid transaction signature is required.' });
     }
 
     try {
-        // Give the wallet listener a moment to potentially see the transaction first.
-        await new Promise(resolve => setTimeout(resolve, 3000)); // 3-second delay
+        // Verify transaction exists on chain
+        let txInfo;
+        let retries = 0;
+        const maxRetries = 10;
+        
+        while (retries < maxRetries) {
+            try {
+                txInfo = await connection.getTransaction(txSig, {
+                    commitment: 'confirmed',
+                    maxSupportedTransactionVersion: 0
+                });
+                if (txInfo) break;
+            } catch (error) {
+                console.log(`Transaction not found, retry ${retries + 1}/${maxRetries}`);
+            }
+            
+            retries++;
+            await new Promise(resolve => setTimeout(resolve, 2000));
+        }
 
-        const description = action === 'save' ? 'Saved surplus (SOL -> RAY)' : 'Staked surplus (SOL -> mSOL)';
+        if (!txInfo) {
+            return res.status(400).json({ 
+                error: 'Transaction not found on blockchain after verification attempts.' 
+            });
+        }
+
+        if (txInfo.meta?.err) {
+            return res.status(400).json({ 
+                error: 'Transaction failed on blockchain.',
+                detail: txInfo.meta.err
+            });
+        }
+
+        const description = action === 'save' ? 'Saved surplus (SOL Transfer)' : 'Staked surplus (Native Staking)';
         const category = action === 'save' ? 'Savings' : 'Staking';
 
         const { usdAmount, ngnAmount, solAmount } = await getCurrencyValues(amount, currency);
 
-        // Use prisma.upsert to either update the listener's record or create a new one.
-        // This is the core of the race condition fix.
+        // Record the transaction
         await prisma.expense.upsert({
             where: { txSig: txSig },
             update: {
                 description: description,
                 category: category,
-                // The listener might not have conversion rates, so we ensure they are set.
                 amountUSD: usdAmount,
                 amountNGN: ngnAmount,
             },
@@ -261,22 +373,31 @@ router.post('/confirm-action', authenticateToken, async (req, res) => {
             }
         });
 
-        // Update goal progress (this logic is the same as before)
+        // Update goal if specified
         if (goalId) {
-            const goal = await prisma.goal.findUnique({ where: { id: goalId } });
+            const goal = await prisma.goal.findUnique({ where: { id: parseInt(goalId) } });
             if (goal) {
-                const amountToAdd = goal.currency === 'USD' ? usdAmount : ngnAmount;
+                const amountToAdd = currency === 'USD' ? usdAmount : ngnAmount;
                 await prisma.goal.update({
-                    where: { id: goalId },
+                    where: { id: parseInt(goalId) },
                     data: { currentAmount: { increment: amountToAdd } }
                 });
             }
         }
 
-        return res.json({ success: true, message: 'Action confirmed and recorded.' });
+        return res.json({ 
+            success: true, 
+            message: 'Action confirmed and recorded.',
+            transactionDetails: {
+                signature: txSig,
+                slot: txInfo.slot,
+                blockTime: txInfo.blockTime,
+                fee: txInfo.meta.fee
+            }
+        });
 
     } catch (err) {
-        console.error("🔴 FATAL CONFIRM ACTION ERROR:", err);
+        console.error("🔴 CONFIRM ACTION ERROR:", err);
         return res.status(500).json({
             error: 'Failed to confirm action on the server.',
             detail: err.message
@@ -284,5 +405,81 @@ router.post('/confirm-action', authenticateToken, async (req, res) => {
     }
 });
 
+// --- UTILITY ENDPOINTS ---
+
+// Check devnet balance
+router.get('/devnet-balance', authenticateToken, async (req, res) => {
+    const { walletAddress } = req.user;
+    
+    try {
+        const publicKey = new PublicKey(walletAddress);
+        const balance = await connection.getBalance(publicKey);
+        
+        return res.json({
+            success: true,
+            balance: {
+                lamports: balance,
+                sol: balance / LAMPORTS_PER_SOL
+            },
+            network: 'devnet'
+        });
+    } catch (err) {
+        return res.status(500).json({
+            error: 'Failed to check devnet balance.',
+            detail: err.message
+        });
+    }
+});
+
+// Check available validators
+router.get('/validators', async (req, res) => {
+    try {
+        const voteAccounts = await connection.getVoteAccounts();
+        
+        const activeValidators = voteAccounts.current
+            .filter(v => v.activatedStake > 0)
+            .sort((a, b) => b.activatedStake - a.activatedStake)
+            .slice(0, 10) // Top 10
+            .map(v => ({
+                votePubkey: v.votePubkey,
+                nodePubkey: v.nodePubkey,
+                activatedStake: v.activatedStake,
+                commission: v.commission,
+                epochCredits: v.epochCredits?.length || 0
+            }));
+
+        return res.json({
+            success: true,
+            network: 'devnet',
+            totalActive: voteAccounts.current.length,
+            totalDelinquent: voteAccounts.delinquent.length,
+            activeValidators
+        });
+    } catch (err) {
+        return res.status(500).json({
+            error: 'Failed to fetch validators.',
+            detail: err.message
+        });
+    }
+});
+
+// Network information
+router.get('/network-info', async (req, res) => {
+    try {
+        const genesisHash = await connection.getGenesisHash();
+        const isDevnet = genesisHash === 'EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG';
+        const slot = await connection.getSlot();
+        
+        return res.json({
+            endpoint: connection.rpcEndpoint,
+            genesisHash,
+            network: isDevnet ? 'devnet' : 'unknown',
+            isDevnet,
+            currentSlot: slot
+        });
+    } catch (error) {
+        return res.status(500).json({ error: error.message });
+    }
+});
 
 export default router;

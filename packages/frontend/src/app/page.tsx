@@ -1,6 +1,5 @@
 'use client';
 
-import AutoSignerModal from './components/autoSignerModal';
 import React, { useState, useEffect } from 'react';
 import { useWallet } from '@solana/wallet-adapter-react';
 import { Bot, ArrowRight } from 'lucide-react';
@@ -9,7 +8,7 @@ import { useRouter } from 'next/navigation';
 
 export default function Home() {
   const [isMounted, setIsMounted] = useState(false);
-  const [showSignerModal, setShowSignerModal] = useState(false);
+  const [isProcessing, setIsProcessing] = useState(false);
   
   const wallet = useWallet();
   const { publicKey, connected } = wallet;
@@ -20,8 +19,13 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
-    if (connected && publicKey) {
-      setShowSignerModal(true);
+    if (connected && publicKey && !isProcessing) {
+      // Add a small delay to ensure wallet is fully connected before signing
+      const timer = setTimeout(() => {
+        handleAutoSign();
+      }, 500);
+      
+      return () => clearTimeout(timer);
     }
   }, [connected, publicKey]);
 
@@ -29,81 +33,81 @@ export default function Home() {
     console.log('Wallet connected:', walletAddress);
   };
 
-  const handleSignerChoice = async (choice: "manual" | "auto") => {
-    setShowSignerModal(false);
-
-    if (!publicKey) {
-      console.error("Public key is null. Cannot proceed.");
+  const handleAutoSign = async () => {
+    if (!publicKey || isProcessing) {
+      console.error("Public key is null or already processing. Cannot proceed.");
       return;
     }
-    
+
+    setIsProcessing(true);
     const walletAddress = publicKey.toBase58();
+    console.log("Starting auto-sign for wallet:", walletAddress);
 
-    console.log("Wallet Address:", walletAddress); 
+    let nonce = null;
+    try {
+      console.log("Starting auto-sign challenge...");
+      
+      // 1. Get the nonce from the backend
+      const challengeResp = await fetch("http://localhost:3001/api/auth/challenge", {
+        method: "POST",
+        body: JSON.stringify({ wallet: walletAddress }),
+        headers: { "Content-Type": "application/json" },
+      });
+      if (!challengeResp.ok) throw new Error('Failed to get challenge');
+      
+      const data = await challengeResp.json();
+      nonce = data.nonce;
 
-    if (choice === "auto") {
-      // Declare nonce outside the try block
-      let nonce = null;
-      try {
-        console.log("Starting auto-sign challenge...");
-        
-        // 1. Get the nonce from the backend
-        const challengeResp = await fetch("http://localhost:3001/api/auth/challenge", {
-          method: "POST",
-          body: JSON.stringify({ wallet: walletAddress }),
-          headers: { "Content-Type": "application/json" },
-        });
-        if (!challengeResp.ok) throw new Error('Failed to get challenge');
-        
-        const data = await challengeResp.json();
-        nonce = data.nonce;
-
-        // 2. Safely sign the message
-        if (!wallet.signMessage) {
-          throw new Error('Wallet does not support the signMessage function.');
-        }
-        
-        const encodedMessage = new TextEncoder().encode(nonce);
-        const signature = await wallet.signMessage(encodedMessage);
-        console.log(signature)
-
-        // 3. Send signature back to the backend
-        // Convert the Uint8Array to a Base64 string for reliable transmission
-        const base64Signature = btoa(String.fromCharCode(...signature));
-        console.log(base64Signature)
-
-        const verifyResp = await fetch("http://localhost:3001/api/auth/verify", {
-          method: "POST",
-          body: JSON.stringify({
-            wallet: walletAddress,
-            signature: base64Signature, // Send as a Base64 string
-          }),
-          headers: { "Content-Type": "application/json" },
-        });
-        
-        if (!verifyResp.ok) throw new Error('Failed to verify signature');
-        const { token } = await verifyResp.json();
-
-        // 4. Store token and navigate
-        localStorage.setItem("lyra_token", token);
-        console.log("✅ Auto-sign enabled, token saved. Navigating to chat...");
-        router.push('/chat');
-
-      } catch (error) {
-        console.error("Auto-sign process failed:", error);
+      // 2. Sign the message
+      if (!wallet.signMessage) {
+        throw new Error('Wallet does not support the signMessage function.');
       }
-    } else {
-      console.log("Manual signing mode selected.");
+      
+      const encodedMessage = new TextEncoder().encode(nonce);
+      
+      // Add error handling for user rejection
+      let signature;
+      try {
+        signature = await wallet.signMessage(encodedMessage);
+      } catch (signError: any) {
+        if (signError.message?.includes('User rejected') || signError.name === 'WalletSignMessageError') {
+          console.log('User rejected signature request');
+          setIsProcessing(false);
+          // Optionally disconnect the wallet
+          await wallet.disconnect();
+          return;
+        }
+        throw signError;
+      }
+      
+      console.log("Message signed successfully");
 
-      // This is the definitive URL string that is about to be pushed
-      const targetUrl = `/chat?wallet=${walletAddress}&mode=manual`;
-      console.log("Navigating to URL:", targetUrl);
+      // 3. Send signature back to the backend
+      const base64Signature = btoa(String.fromCharCode(...signature));
 
-      router.push(targetUrl);
+      const verifyResp = await fetch("http://localhost:3001/api/auth/verify", {
+        method: "POST",
+        body: JSON.stringify({
+          wallet: walletAddress,
+          signature: base64Signature,
+        }),
+        headers: { "Content-Type": "application/json" },
+      });
+      
+      if (!verifyResp.ok) throw new Error('Failed to verify signature');
+      const { token } = await verifyResp.json();
+
+      // 4. Store token and navigate
+      localStorage.setItem("lyra_token", token);
+      console.log("✅ Auto-sign enabled, token saved. Navigating to chat...");
+      router.push('/chat');
+
+    } catch (error) {
+      console.error("Auto-sign process failed:", error);
+      setIsProcessing(false);
     }
   };
 
-  // The rest of your JSX remains the same
   return (
     <div className="min-h-screen bg-gradient-to-br from-black via-gray-900/40 to-black text-white font-mono">
       {/* Navigation */}
@@ -128,7 +132,7 @@ export default function Home() {
             <div className="flex items-center gap-4">
             {connected && publicKey ? (
               <div className="text-sm text-green-400 font-light">
-                Connected: {publicKey.toBase58().slice(0, 6)}...{publicKey.toBase58().slice(-4)}
+                {isProcessing ? 'Signing in...' : `Connected: ${publicKey.toBase58().slice(0, 6)}...${publicKey.toBase58().slice(-4)}`}
               </div>
             ) : null}
             </div>
@@ -154,12 +158,10 @@ export default function Home() {
             <div className="flex flex-col sm:flex-row items-center justify-center gap-6 pt-8">
               <WalletConnection onWalletConnected={handleWalletConnected} />
               
-              {connected && (
-                <div className="group">
-                  <button className="px-8 py-4 bg-gray-900/90 backdrop-blur-sm border border-gray-700/50 rounded-2xl hover:bg-gray-800/90 transition-all duration-300 flex items-center gap-3 shadow-xl shadow-black/50 hover:scale-105">
-                    <span className="font-light tracking-wide">Start Chatting</span>
-                    <ArrowRight className="w-4 h-4 group-hover:translate-x-1 transition-transform" />
-                  </button>
+              {isProcessing && (
+                <div className="flex items-center gap-2 text-purple-300">
+                  <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-purple-400"></div>
+                  <span className="text-sm font-light">Setting up your AI agent...</span>
                 </div>
               )}
             </div>
@@ -191,15 +193,6 @@ export default function Home() {
             </div>
           </div>
         </div>
-      </div>
-
-      {/* Modal */}
-      <div>
-        <AutoSignerModal
-          isOpen={showSignerModal}
-          onChoice={handleSignerChoice}
-          walletAddress={publicKey ? publicKey.toBase58() : ''}
-        />
       </div>
     </div>
   );

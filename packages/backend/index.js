@@ -12,6 +12,7 @@ import { parseIntent } from '@sol-ai/agent';
 import cron from "node-cron"
 import actionRoutes from "./actionRoutes.js"
 import reportRoute from './reportRoute.js'
+import { startCronJobs } from './cronService.js'; 
 
 import pkg from '@prisma/client';
 import { Wallet } from "@coral-xyz/anchor";
@@ -64,6 +65,9 @@ io.on("connection", (socket) => {
     // Join a room specific to this wallet
     socket.join(walletAddress);
 
+    socket.emit('registered', { walletAddress, socketId: socket.id });
+    console.log(`✅ Wallet ${walletAddress} successfully joined room`);
+
     // Check if a listener for this wallet is already active
     if (!activeListeners.has(walletAddress)) {
       const listener = new WalletListener(walletAddress, io);
@@ -75,112 +79,11 @@ io.on("connection", (socket) => {
 
  
 
-cron.schedule('0 0 * * *', async () => {
-  console.log('⏰ Running daily check for ended budgets...');
-  try {
-    const now = new Date();
-
-    // 1. Find all active budgets whose end date has passed.
-    const endedBudgets = await prisma.budget.findMany({
-      where: {
-        status: 'ACTIVE',
-        endDate: {
-          lte: now, // Find budgets whose end date is now or in the past
-        },
-      },
-      include: {
-        user: {
-          include: {
-            expenses: true, // Include expenses to calculate surplus
-          },
-        },
-      },
-    });
-
-    if (endedBudgets.length === 0) {
-      console.log('No budgets ended today.');
-      return;
-    }
-
-    console.log(`Found ${endedBudgets.length} budget(s) to process.`);
-
-    for (const budget of endedBudgets) {
-      // 2. Calculate the surplus for the completed period.
-      const expensesInPeriod = budget.user.expenses.filter(
-        (exp) =>
-          exp.type === 'expense' &&
-          new Date(exp.createdAt) >= budget.startDate &&
-          new Date(exp.createdAt) < budget.endDate
-      );
-
-      const totalSpent = expensesInPeriod.reduce(
-        (sum, exp) => sum + (exp.amountNGN || 0),
-        0
-      );
-      
-      const surplus = budget.amount - totalSpent;
-
-      if (surplus > 0) {
-        console.log(
-          `✅ User ${budget.user.walletAddress} has a surplus of ${surplus.toFixed(2)} ${budget.currency}!`
-        );
-        // TODO: Implement your "Save" or "Stake" logic here.
-        // This could involve a Solana blockchain transaction.
-        // For now, you could save it to a 'Savings' model in your DB.
-      } else {
-        console.log(`User ${budget.user.walletAddress} has no surplus for this period.`);
-      }
-
-      // 3. Mark the processed budget as 'ENDED'.
-      await prisma.budget.update({
-        where: { id: budget.id },
-        data: { status: 'ENDED' },
-      });
-
-       // ✨ --- NEW CONDITIONAL LOGIC --- ✨
-      if (budget.isRecurring) {
-        // If the budget is set to recur, create the next one automatically.
-        // ... (this is the same logic you had before for creating a new budget)
-        const newStartDate = new Date(budget.endDate);
-        const newEndDate = new Date(newStartDate);
-
-        if (budget.period === 'daily') {
-          newEndDate.setDate(newStartDate.getDate() + 1);
-        } else if (budget.period === 'weekly') {
-          newEndDate.setDate(newStartDate.getDate() + 7);
-        } else { // monthly
-          newEndDate.setMonth(newStartDate.getMonth() + 1);
-        }
-        
-        await prisma.budget.create({
-          data: { /* ... all budget fields ... */ },
-        });
-
-        console.log(`New recurring budget created for user ${budget.user.walletAddress}.`);
-
-      } else {
-        // If not recurring, send a prompt to the user via Socket.IO.
-        const walletAddress = budget.user.walletAddress;
-        
-        const promptMessage = {
-            reply: `Your ${budget.period} budget of ${budget.amount} ${budget.currency} has ended. Would you like to set a new one?`,
-            // You can add suggested actions for your frontend UI
-            suggestions: [`Yes, set another ${budget.period} budget`, "No thanks"], 
-        };
-
-        io.to(walletAddress).emit('budget_ended_prompt', promptMessage);
-        console.log(`Sent budget-ended prompt to user ${walletAddress}.`);
-      }
-    }
-  } catch (err) {
-    console.error('❌ Error in scheduled budget task:', err);
-  }
-});
-
+startCronJobs(io)
 
 
 app.post('/api/user/create', async (req, res) => {
-  const { walletAddress, name } = req.body;
+  const { walletAddress, name, email } = req.body;
 
   if (!walletAddress) {
     return res.status(400).json({ error: 'Wallet address is required' });
@@ -202,6 +105,7 @@ app.post('/api/user/create', async (req, res) => {
         where: { walletAddress },
         data: { 
           name: name.trim(),
+          email: email,
           updatedAt: new Date()
         }
       });
@@ -216,7 +120,8 @@ app.post('/api/user/create', async (req, res) => {
       const newUser = await prisma.user.create({
         data: {
           walletAddress,
-          name: name.trim()
+          name: name.trim(),
+          email: email
         }
       });
 
@@ -231,6 +136,8 @@ app.post('/api/user/create', async (req, res) => {
     return res.status(500).json({ error: 'Failed to create user' });
   }
 });
+
+
 
 app.get('/api/user/:wallet', async (req, res) => {
   // The fix is here: The route parameter is now ':wallet', so req.params.wallet will be defined.
@@ -569,24 +476,29 @@ app.post('/api/ai/parse', async (req, res) => {
                 finalReply = `Your budget has been successfully updated to ${Number(intent.amount).toLocaleString()} ${intent.currency} per ${period}.`;
             } 
             // ✨ FIX: Re-added the get_budget logic with robust date checking.
-            else if (intent.action === "get_budget") {
-                if (userWithData && userWithData.budget) {
+           else if (intent.action === "get_budget") {
+                // Check if this is a direct budget query by looking at the original message
+                const isDirectBudgetQuery = message.toLowerCase().match(/(what.*budget|show.*budget|my budget|current budget|budget.*is)/i);
+                
+                if (isDirectBudgetQuery && userWithData && userWithData.budget) {
                     const budget = userWithData.budget;
                     
                     // Check if the dates are valid before trying to use them.
                     if (budget.startDate && budget.endDate) {
                         const startDate = new Date(budget.startDate);
                         const endDate = new Date(budget.endDate);
-                        // If data is good, create a precise, data-driven reply.
+                        // Override with structured budget display for direct queries
                         finalReply = `Your current ${budget.period} budget is ${budget.amount.toLocaleString()} ${budget.currency}. It is active from ${startDate.toLocaleDateString()} to ${endDate.toLocaleDateString()}.`;
                     } else {
                         // If dates are null or missing, provide a safe fallback.
                         finalReply = `You have a budget set for ${budget.amount.toLocaleString()} ${budget.currency}, but its dates are not configured correctly. You can set a new one to fix this.`;
                     }
-                } else {
-                    // If no budget exists at all, provide a helpful message.
+                } else if (isDirectBudgetQuery && (!userWithData || !userWithData.budget)) {
+                    // If no budget exists for direct query, provide a helpful message.
                     finalReply = "You don't have a budget set up yet. You can create one by saying, for example, 'Set a weekly budget of 50,000 NGN'.";
                 }
+                // For non-direct queries, keep the AI's original contextual reply
+                // This allows the AI to use budget info in complex responses without override
             }
             else if (intent.action === "set_goal") {
                 const user = await prisma.user.upsert({
@@ -622,6 +534,31 @@ app.post('/api/ai/parse', async (req, res) => {
             // The AI has already crafted a reply like "Sure, preparing your report now..."
             // We don't need to override it. The frontend will handle the download.
             // This block is here to formally recognize the action.
+        }
+
+         if (intent.action === "advise_on_surplus") {
+            // The AI has provided advice. Save its suggestion to the database.
+            if (intent.suggestedSplit) {
+                await prisma.user.update({
+                    where: { walletAddress },
+                    data: { lastSuggestedSplit: intent.suggestedSplit }
+                });
+            }
+        }
+        else if (intent.action === "execute_split") {
+            // The user wants to act. Retrieve the last saved split.
+            const user = await prisma.user.findUnique({ where: { walletAddress } });
+            
+            // If the AI provided a new split (direct command), use it.
+            // Otherwise, use the one we saved in the database from the last advice.
+            const splitToExecute = intent.suggestedSplit || user?.lastSuggestedSplit;
+
+            if (!splitToExecute) {
+                finalReply = "I'm not sure what split to execute. Could you first ask for my advice on how to manage your surplus?";
+            } else {
+                // Pass the split to execute back to the frontend in the intent object.
+                intent.suggestedSplit = splitToExecute;
+            }
         }
 
         return res.json({

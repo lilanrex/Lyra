@@ -7,46 +7,127 @@ import { authenticatedFetch } from '../utils/auth'; // Reusing this from your ot
 import io from 'socket.io-client';
 import Link from 'next/link'; // Import Link component
 import { useSocket } from '../context/socketContext'; 
+import { Transaction, VersionedTransaction } from '@solana/web3.js';
+import { useConnection, useWallet } from '@solana/wallet-adapter-react';
+import { WalletSendTransactionError } from '@solana/wallet-adapter-base';
 
 // Define the AppUser type
 interface AppUser {
     id: number;
     walletAddress: string;
     name: string | null;
+    email: string | null
+}
+
+interface Budget {
+    amount: number;
+    currency: 'NGN' | 'USD';
+    startDate: string; 
+}
+
+interface Expense {
+    amountUSD: number | null;
+    amountNGN: number | null;
+    type: 'income' | 'expense';
+    createdAt: string;
 }
 
 // ... (Your existing types and NameInputModal component) ...
 
 // Simple NameInputModal definition (replace with your actual implementation if needed)
+
+
+// Updated NameInputModal component in your chat page
 interface NameInputModalProps {
-    onSubmit: (name: string) => void;
+    onSubmit: (name: string, email: string) => void;
     walletAddress: string;
 }
 
 const NameInputModal: React.FC<NameInputModalProps> = ({ onSubmit, walletAddress }) => {
     const [name, setName] = useState('');
+    const [email, setEmail] = useState('');
+    const [emailError, setEmailError] = useState('');
+
+    const validateEmail = (email: string) => {
+        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+        return emailRegex.test(email);
+    };
+
+    const handleSubmit = () => {
+        if (!name.trim()) {
+            return;
+        }
+        
+        if (!email.trim()) {
+            setEmailError('Email is required');
+            return;
+        }
+        
+        if (!validateEmail(email.trim())) {
+            setEmailError('Please enter a valid email address');
+            return;
+        }
+        
+        setEmailError('');
+        onSubmit(name.trim(), email.trim());
+    };
+
+    const handleKeyPress = (e: React.KeyboardEvent) => {
+        if (e.key === 'Enter') {
+            handleSubmit();
+        }
+    };
+
     return (
         <div className="fixed inset-0 bg-black bg-opacity-60 flex items-center justify-center z-50">
             <div className="bg-gray-900 rounded-xl p-8 shadow-2xl max-w-sm w-full">
                 <h2 className="text-lg font-bold mb-4 text-white">Welcome!</h2>
                 <p className="text-gray-400 mb-4 text-sm">
-                    Please enter your name to personalize your experience.
+                    Please enter your details to personalize your experience.
                 </p>
-                <input
-                    type="text"
-                    value={name}
-                    onChange={e => setName(e.target.value)}
-                    placeholder="Your name"
-                    className="w-full px-3 py-2 rounded bg-gray-800 text-white mb-4 border border-gray-700 focus:outline-none"
-                />
+                
+                <div className="space-y-4">
+                    <div>
+                        <label className="text-xs text-gray-500 mb-1 block">Name</label>
+                        <input
+                            type="text"
+                            value={name}
+                            onChange={e => setName(e.target.value)}
+                            onKeyPress={handleKeyPress}
+                            placeholder="Your name"
+                            className="w-full px-3 py-2 rounded bg-gray-800 text-white border border-gray-700 focus:outline-none focus:border-purple-500 transition-colors"
+                        />
+                    </div>
+                    
+                    <div>
+                        <label className="text-xs text-gray-500 mb-1 block">Email</label>
+                        <input
+                            type="email"
+                            value={email}
+                            onChange={e => {
+                                setEmail(e.target.value);
+                                setEmailError('');
+                            }}
+                            onKeyPress={handleKeyPress}
+                            placeholder="your.email@example.com"
+                            className="w-full px-3 py-2 rounded bg-gray-800 text-white border border-gray-700 focus:outline-none focus:border-purple-500 transition-colors"
+                        />
+                        {emailError && (
+                            <p className="text-red-400 text-xs mt-1">{emailError}</p>
+                        )}
+                    </div>
+                </div>
+                
                 <button
-                    onClick={() => name.trim() && onSubmit(name.trim())}
-                    className="w-full bg-purple-600 hover:bg-purple-700 text-white py-2 rounded font-bold transition"
+                    onClick={handleSubmit}
+                    disabled={!name.trim() || !email.trim()}
+                    className="w-full bg-purple-600 hover:bg-purple-700 text-white py-2 rounded font-bold transition mt-6 disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                     Continue
                 </button>
+                
                 <p className="text-xs text-gray-500 mt-4 text-center font-mono opacity-60">
-                    Wallet: {walletAddress}
+                    Wallet: {walletAddress.slice(0, 6)}...{walletAddress.slice(-4)}
                 </p>
             </div>
         </div>
@@ -78,11 +159,15 @@ export default function ChatPage() {
     const [showNameModal, setShowNameModal] = useState(false);
     const [isLoading, setIsLoading] = useState(true); // New loading state
     const { socket } = useSocket();
+     const [surplus, setSurplus] = useState(0);
+    const [budget, setBudget] = useState<Budget | null>(null);
+
 
     const messagesEndRef = useRef<HTMLDivElement | null>(null);
     const router = useRouter();
     const searchParams = useSearchParams();
-
+ const { publicKey, sendTransaction, connected } = useWallet();
+  const { connection } = useConnection();
     // Add handleKeyPress function
     const handleKeyPress = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
         if (e.key === 'Enter' && !e.shiftKey) {
@@ -119,9 +204,8 @@ export default function ChatPage() {
                     const userData = data.user as AppUser;
                     setUser(userData);
                     userWalletAddress = userData.walletAddress;
-                    if (!userData.name) {
-                        setShowNameModal(true);
-                    }
+                    if (!userData.name || !userData.email) {
+                      setShowNameModal(true);}
                 }
             } catch (error) {
                 console.error("Token validation error:", error);
@@ -131,7 +215,7 @@ export default function ChatPage() {
         } 
         // Scenario 2: User is in the manual-sign flow
         else if (walletAddressFromUrl && modeFromUrl === 'manual') {
-            const tempUser: AppUser = { id: 0, walletAddress: walletAddressFromUrl, name: null };
+            const tempUser: AppUser = { id: 0, walletAddress: walletAddressFromUrl, name: null, email: null };
             setUser(tempUser);
             setShowNameModal(true);
             userWalletAddress = walletAddressFromUrl;
@@ -144,33 +228,86 @@ export default function ChatPage() {
 
         setIsLoading(false);
 
-        if (userWalletAddress && socket) {
-                socket.emit('register_wallet', userWalletAddress);
-
-                socket.on('new_tx', (newTx) => {
-                    console.log("New transaction received:", newTx);
-                    const txMessage = {
-                        id: window.crypto.randomUUID(),
-                        type: 'ai' as const,
-                        content: `🔔 Transaction Alert: ${newTx.amount} ${newTx.currency} - ${newTx.type} (${newTx.category})`,
-                        timestamp: new Date().toLocaleTimeString(),
-                    };
-                    setMessages((prevMessages: any) => [...prevMessages, txMessage]);
-                });
-
-                
-
-                return () => {
-                    socket.disconnect();
-                    console.log('WebSocket client disconnected on cleanup.');
-                };
-            }
+     
 
       
     };
     
     initializeUser();
 }, [router, searchParams]);
+
+useEffect(() => {
+    if (!socket || !user?.walletAddress) return;
+
+    console.log('📡 Setting up socket listeners for:', user.walletAddress);
+    
+    socket.emit('register_wallet', user.walletAddress);
+    
+    const handleRegistered = (data: { walletAddress: string }) => {
+        console.log('✅ Wallet registered:', data);
+    };
+    
+    interface TransactionData {
+        amount: number;
+        currency: string;
+        type: string;
+        category: string;
+    }
+
+    const handleNewTx = (newTx: TransactionData) => {
+        console.log("🔔 New transaction received:", newTx);
+        const txMessage = {
+            id: window.crypto.randomUUID(),
+            type: 'ai' as const,
+            content: `🔔 Transaction Alert: ${newTx.amount} ${newTx.currency} - ${newTx.type} (${newTx.category})`,
+            timestamp: new Date().toLocaleTimeString(),
+        };
+        setMessages((prevMessages: any) => [...prevMessages, txMessage]);
+    };
+    
+    interface BudgetPromptData {
+        reply: string;
+    }
+
+    const handleBudgetPrompt = (promptData: BudgetPromptData) => {
+        console.log("💰 Budget prompt received:", promptData);
+        const budgetMessage = {
+            id: window.crypto.randomUUID(),
+            type: 'ai' as const,
+            content: promptData.reply,
+            timestamp: new Date().toLocaleTimeString(),
+        };
+        setMessages((prevMessages: any) => [...prevMessages, budgetMessage]);
+    };
+    
+    interface SurplusNotification {
+        reply: string;
+    }
+
+    const handleSurplus = (notificationPayload: SurplusNotification) => {
+        console.log("💵 Surplus detected:", notificationPayload);
+        const surplusMessage = {
+            id: window.crypto.randomUUID(),
+            type: 'ai' as const,
+            content: notificationPayload.reply,
+            timestamp: new Date().toLocaleTimeString(),
+        };
+        setMessages((prevMessages: any) => [...prevMessages, surplusMessage]);
+    };
+    
+    socket.on('registered', handleRegistered);
+    socket.on('new_tx', handleNewTx);
+    socket.on('budget_ended_prompt', handleBudgetPrompt);
+    socket.on('surplus_detected', handleSurplus);
+    
+    return () => {
+        socket.off('registered', handleRegistered);
+        socket.off('new_tx', handleNewTx);
+        socket.off('budget_ended_prompt', handleBudgetPrompt);
+        socket.off('surplus_detected', handleSurplus);
+        console.log('🔌 Socket listeners cleaned up');
+    };
+}, [socket, user?.walletAddress]); 
 
 
   ;
@@ -183,34 +320,65 @@ export default function ChatPage() {
         scrollToBottom();
     }, [messages]);
 
-    // Function to handle name submission from the modal
-    const handleNameSubmit = async (name: string) => {
-        if (!user?.walletAddress) return;
-        
-        try {
-            // Update the user's name on the backend
-            const res = await fetch('http://localhost:3001/api/user/create', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ walletAddress: user.walletAddress, name })
-            });
-            const data = await res.json();
-            
-            if (res.ok && data.success) {
-                // Update the local state with the new user data
-                const updatedUser: AppUser = { ...user, name: data.user.name };
-                setUser(updatedUser);
-                setShowNameModal(false);
-                setMessages((prev: typeof messages) => [...prev, {
-                    id: prev.length + 2, type: 'ai', content: `Awesome, ${name}! I've got you set up. How can I help you today?`, timestamp: new Date().toLocaleTimeString()
-                }]);
-            } else {
-                throw new Error(data.error || 'Failed to update name');
+    useEffect(() => {
+        const fetchFinancials = async () => {
+            if (user?.walletAddress) {
+                try {
+                    // This new endpoint efficiently gets all necessary financial data
+                    const res = await authenticatedFetch(`http://localhost:3001/api/reports/financials/${user.walletAddress}`);
+                    const data = await res.json();
+                    if (data.success) {
+                        setBudget(data.budget);
+                        setSurplus(data.surplus > 0 ? data.surplus : 0);
+                    }
+                } catch (error) {
+                    console.error("Failed to fetch financial data for chat:", error);
+                }
             }
-        } catch (error) {
-            console.error("Error submitting name:", error);
+        };
+        fetchFinancials();
+    }, [user]); // Re
+
+    // Function to handle name submission from the modal
+    // Update this function in your chat page
+const handleNameSubmit = async (name: string, email: string) => {
+    if (!user?.walletAddress) return;
+    
+    try {
+        // Update the user's name and email on the backend
+        const res = await fetch('http://localhost:3001/api/user/create', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ 
+                walletAddress: user.walletAddress, 
+                name,
+                email 
+            })
+        });
+        const data = await res.json();
+        
+        if (res.ok && data.success) {
+            // Update the local state with the new user data
+            const updatedUser: AppUser = { 
+                ...user, 
+                name: data.user.name,
+                email: data.user.email 
+            };
+            setUser(updatedUser);
+            setShowNameModal(false);
+            setMessages((prev: typeof messages) => [...prev, {
+                id: prev.length + 2, 
+                type: 'ai', 
+                content: `Awesome, ${name}! I've got you set up. How can I help you today?`, 
+                timestamp: new Date().toLocaleTimeString()
+            }]);
+        } else {
+            throw new Error(data.error || 'Failed to update user details');
         }
-    };
+    } catch (error) {
+        console.error("Error submitting user details:", error);
+    }
+};
 
 
      // ✨ 1. Add a new handler function for the download
@@ -238,34 +406,90 @@ export default function ChatPage() {
             setMessages((prev: typeof messages) => [...prev, errorMessage]);
         }
     };
+
+
+
+
+    const handleOnChainAction = async (action: 'save' | 'stake', amount: number, currency: string, goalId?: number) => {
+        if (!connected || !publicKey) {
+            // ... (error handling)
+            return;
+        }
+
+        setIsTyping(true);
+        try {
+            const res = await authenticatedFetch(`http://localhost:3001/api/action/${action}`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ amount, currency, goalId }),
+            });
+            if (!res.ok) {
+                const errorData = await res.json();
+                throw new Error(errorData.detail || 'Failed to prepare transaction.');
+            }
+            
+            const { transaction: serializedTransaction } = await res.json();
+            const transactionBuffer = Buffer.from(serializedTransaction, 'base64');
+            
+            let transaction;
+            try {
+                transaction = Transaction.from(transactionBuffer);
+            } catch (e) {
+                transaction = VersionedTransaction.deserialize(transactionBuffer);
+            }
+            
+            const txSignature = await sendTransaction(transaction, connection);
+            
+            await authenticatedFetch(`http://localhost:3001/api/action/confirm-action`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ txSig: txSignature, action, amount, currency, goalId }),
+            });
+
+            const successMessage = {
+                id: window.crypto.randomUUID(),
+                type: 'ai' as const,
+                content: `✅ Success! I've initiated the ${action} of ${amount.toFixed(2)} ${currency}. You can view the transaction on Solscan once confirmed.`,
+            };
+            setMessages((prev: any) => [...prev, successMessage]);
+
+        } catch (error: any) {
+            // Add a detailed error message to the chat
+            const errorMessageContent = error instanceof Error ? error.message : "An unexpected error occurred.";
+            const errorMessage = {
+                id: window.crypto.randomUUID(),
+                type: 'ai' as const,
+                content: `⚠️ Action Failed: ${errorMessageContent}`,
+            };
+            setMessages((prev: any) => [...prev, errorMessage]);
+        } finally {
+            setIsTyping(false);
+        }
+    };
+
+
     // Function to handle sending a message
-   const handleSendMessage = async () => {
-    // Trim the message to remove leading/trailing whitespace
+  const handleSendMessage = async () => {
     const userMessage = inputValue.trim();
     if (!userMessage || isTyping) return;
 
-    // 1. Add user's message to the chat display
     const newUserMessage = {
-        id:window.crypto.randomUUID(),
+        id: window.crypto.randomUUID(),
         type: 'user' as const,
         content: userMessage,
         timestamp: new Date().toLocaleTimeString(),
     };
     setMessages((prevMessages: typeof messages) => [...prevMessages, newUserMessage]);
-    setInputValue(''); // 2. Clear the input field
-
-    // 3. Set typing indicator
+    setInputValue('');
     setIsTyping(true);
 
     try {
-        // Ensure user and wallet address exist
         if (!user || !user.walletAddress) {
             console.error('User or wallet address is missing. Cannot send message to AI.');
             setIsTyping(false);
             return;
         }
 
-        // 4. Send the message to the backend's AI route
         const response = await fetch('http://localhost:3001/api/ai/parse', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -279,30 +503,136 @@ export default function ChatPage() {
         const data = await response.json();
         const aiReply = data.reply;
 
-        // 5. Add the AI's reply to the chat display
         const newAiMessage = {
-            id:window.crypto.randomUUID(),
+            id: window.crypto.randomUUID(),
             type: 'ai' as const,
             content: aiReply,
             timestamp: new Date().toLocaleTimeString(),
         };
         setMessages((prevMessages: typeof messages) => [...prevMessages, newAiMessage]);
 
-         if (data.intent?.action === 'generate_report') {
-                await handleDownloadReport();
+        // Handle different intent actions
+        if (data.intent?.action === 'generate_report') {
+            await handleDownloadReport();
+        }
+
+        // FIX: Improved execute_split action handling
+        if (data.intent?.action === 'execute_split') {
+            console.log("[Chat Page] Execute split action detected:", data.intent);
+
+            try {
+                // Get fresh financial data
+                const financialsRes = await authenticatedFetch(`http://localhost:3001/api/reports/financials/${user.walletAddress}`);
+                
+                if (!financialsRes.ok) {
+                    throw new Error('Failed to fetch financial data');
+                }
+
+                const financialsData = await financialsRes.json();
+                console.log("[Chat Page] Financials data received:", financialsData);
+
+                if (!financialsData.success) {
+                    throw new Error('Financial data request was not successful');
+                }
+
+                if (!financialsData.surplus || financialsData.surplus <= 0) {
+                    const noSurplusMessage = {
+                        id: window.crypto.randomUUID(),
+                        type: 'ai' as const,
+                        content: "It looks like you don't have a surplus to take action on right now.",
+                        timestamp: new Date().toLocaleTimeString(),
+                    };
+                    setMessages((prev: any) => [...prev, noSurplusMessage]);
+                    return;
+                }
+
+                const freshSurplus = financialsData.surplus;
+                const budgetCurrency = financialsData.budget?.currency || 'USD';
+                
+                // Parse the suggestedSplit JSON string
+                let split;
+                try {
+                    split = typeof data.intent.suggestedSplit === 'string' 
+                        ? JSON.parse(data.intent.suggestedSplit) 
+                        : data.intent.suggestedSplit;
+                } catch (parseError) {
+                    console.error("[Chat Page] Failed to parse suggestedSplit:", data.intent.suggestedSplit);
+                    throw new Error('Invalid split configuration received from AI');
+                }
+
+                console.log("[Chat Page] Processing split:", { freshSurplus, budgetCurrency, split });
+
+                // Execute actions in sequence to avoid conflicts
+                type ActionItem = {
+                    action: 'save' | 'stake';
+                    amount: number;
+                };
+                const actions: ActionItem[] = [];
+                
+                if (split.stakePercent && split.stakePercent > 0) {
+                    const stakeAmount = freshSurplus * (split.stakePercent / 100);
+                    actions.push({ action: 'stake', amount: stakeAmount });
+                }
+
+                if (split.savePercent && split.savePercent > 0) {
+                    const saveAmount = freshSurplus * (split.savePercent / 100);
+                    actions.push({ action: 'save', amount: saveAmount });
+                }
+
+                // Execute actions sequentially
+                for (const actionItem of actions) {
+                    console.log(`[Chat Page] Executing ${actionItem.action} action:`, actionItem.amount);
+                    try {
+                        await handleOnChainAction(actionItem.action, actionItem.amount, budgetCurrency, data.intent.goalId);
+                        // Add a small delay between actions to ensure they don't conflict
+                        if (actions.length > 1) {
+                            await new Promise(resolve => setTimeout(resolve, 1000));
+                        }
+                    } catch (actionError: any) {
+                        console.error(`[Chat Page] Error executing ${actionItem.action}:`, actionError);
+                        const actionErrorMessage = {
+                            id: window.crypto.randomUUID(),
+                            type: 'ai' as const,
+                            content: `Failed to execute ${actionItem.action}: ${actionError.message}`,
+                            timestamp: new Date().toLocaleTimeString(),
+                        };
+                        setMessages((prev: any) => [...prev, actionErrorMessage]);
+                    }
+                }
+
+                // If no percentages were provided, show an error
+                if ((!split.stakePercent || split.stakePercent <= 0) && (!split.savePercent || split.savePercent <= 0)) {
+                    const invalidSplitMessage = {
+                        id: window.crypto.randomUUID(),
+                        type: 'ai' as const,
+                        content: "I couldn't determine valid percentages for saving or staking. Please try rephrasing your request.",
+                        timestamp: new Date().toLocaleTimeString(),
+                    };
+                    setMessages((prev: any) => [...prev, invalidSplitMessage]);
+                }
+
+            } catch (splitError: any) {
+                console.error("[Chat Page] Error in execute_split:", splitError);
+                const errorMessage = {
+                    id: window.crypto.randomUUID(),
+                    type: 'ai' as const,
+                    content: `Error executing your request: ${splitError.message || 'Unknown error occurred'}`,
+                    timestamp: new Date().toLocaleTimeString(),
+                };
+                setMessages((prev: any) => [...prev, errorMessage]);
             }
+        }
+
     } catch (error) {
         console.error('Error sending message to AI:', error);
-        // Display an error message to the user
         const errorMessage = {
-            id: messages.length + 2,
+            id: window.crypto.randomUUID(), // Use crypto.randomUUID() instead of messages.length
             type: 'ai' as const,
             content: 'Sorry, I am having trouble connecting right now. Please try again later.',
             timestamp: new Date().toLocaleTimeString(),
         };
         setMessages((prevMessages: typeof messages) => [...prevMessages, errorMessage]);
     } finally {
-        // 6. Hide typing indicator
         setIsTyping(false);
     }
 };

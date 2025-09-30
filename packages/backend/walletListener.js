@@ -2,6 +2,8 @@
 import { Connection, PublicKey, clusterApiUrl, LAMPORTS_PER_SOL } from "@solana/web3.js";
 import { PrismaClient } from "@prisma/client";
 import fetch from 'node-fetch'
+import { sendTransactionNotification } from "./emailService.js";
+
 
 // Import your AI categorizer function
 import { categorizeTx } from "./aiCategorizer.js";
@@ -174,6 +176,14 @@ class WalletListener {
                 },
               },
             });
+
+            const user = await prisma.user.findUnique({
+                where: { walletAddress: this.walletAddress }
+            });
+            // Then, send the notification
+            await sendTransactionNotification(user, record);
+
+            console.log('🚀 EMITTING new_tx TO ROOM:', this.walletAddress, 'DATA:', record);
 
             this.io.to(this.walletAddress).emit("new_tx", record);
           }
