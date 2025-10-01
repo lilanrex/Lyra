@@ -37,6 +37,17 @@ app.use('/api/action', actionRoutes)
 app.use('/api/reports', reportRoute)
 
 
+app.use(cors({
+  origin: [
+    'http://localhost:3000', 
+    process.env.VERCEL_URL, 
+  ],
+  credentials: true, 
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
+
+
 const httpServer = createServer(app);
 
 // --- Initialize Socket.IO
